@@ -161,3 +161,4 @@ class ViolenciaIntrafamiliarEvent(BaseModel):
             return cls(**data)
         except Exception as e:
             raise EventContractViolationError(f"Event contract validation failed: {str(e)}") from e
+

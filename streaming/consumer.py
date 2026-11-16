@@ -278,3 +278,4 @@ if __name__ == "__main__":
         group_id=args.group,
         max_messages=args.max_messages
     )
+

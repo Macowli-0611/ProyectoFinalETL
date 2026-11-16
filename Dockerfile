@@ -29,3 +29,4 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8080 8501
 
 CMD ["python", "src/run_pipeline.py"]
+

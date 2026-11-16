@@ -186,3 +186,4 @@ if __name__ == "__main__":
         test_experiment_1_invalid_event(args.servers, args.topic)
     if args.experiment in ["all", "2"]:
         test_experiment_2_interruption_and_backlog(args.servers, args.topic)
+

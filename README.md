@@ -284,3 +284,4 @@ Demonstrates zero data loss when the consumer is offline during event publicatio
 4. **Known Limitations:**
    - Simulated streaming rate is constrained by local host resources.
    - Streamlit dashboard uses polling rather than WebSockets, creating an update latency bounded by the 3-second refresh slider.
+

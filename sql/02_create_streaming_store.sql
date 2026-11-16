@@ -88,3 +88,4 @@ CREATE TABLE streaming_municipal_metrics (
 
 CREATE INDEX idx_stream_muni_victimas ON streaming_municipal_metrics(victimas_recientes DESC);
 CREATE INDEX idx_stream_muni_deficit  ON streaming_municipal_metrics(tiene_deficit_ley_2126);
+

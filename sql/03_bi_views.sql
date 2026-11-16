@@ -123,3 +123,4 @@ SELECT
     m.ultima_alerta
 FROM streaming_municipal_metrics m
 ORDER BY m.victimas_recientes DESC, m.ultima_alerta DESC;
+

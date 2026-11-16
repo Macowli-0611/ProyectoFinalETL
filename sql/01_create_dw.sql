@@ -111,3 +111,4 @@ CREATE INDEX idx_dim_tiempo_anio    ON dim_tiempo(anio);
 CREATE INDEX idx_dim_geo_depto      ON dim_geografia(codigo_dane_departamento);
 CREATE INDEX idx_dim_geo_categoria  ON dim_geografia(categoria_municipio);
 CREATE INDEX idx_dim_geo_brecha     ON dim_geografia(brecha_comisarias);
+

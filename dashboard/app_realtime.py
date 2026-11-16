@@ -20,6 +20,9 @@ import plotly.graph_objects as go
 import psycopg2
 import streamlit as st
 
+import sqlalchemy
+from sqlalchemy import create_engine
+
 # Page configuration
 st.set_page_config(
     page_title="Streaming ETL — Violencia Intrafamiliar & Déficit Institucional",
@@ -56,20 +59,20 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-def get_connection():
-    return psycopg2.connect(
-        host=os.getenv("DB_HOST", "localhost"),
-        port=int(os.getenv("DB_PORT", 5432)),
-        dbname=os.getenv("DB_NAME", "etl_dw"),
-        user=os.getenv("DB_USER", "postgres"),
-        password=os.getenv("DB_PASSWORD", "postgres123"),
-        connect_timeout=5
-    )
+@st.cache_resource
+def get_db_engine():
+    host = os.getenv("DB_HOST", "localhost")
+    port = int(os.getenv("DB_PORT", 5432))
+    dbname = os.getenv("DB_NAME", "etl_dw")
+    user = os.getenv("DB_USER", "postgres")
+    password = os.getenv("DB_PASSWORD", "postgres123")
+    url = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+    return create_engine(url, pool_pre_ping=True)
 
 
 def load_streaming_data():
-    conn = get_connection()
-    try:
+    engine = get_db_engine()
+    with engine.connect() as conn:
         # 1. Global KPIs
         metrics_df = pd.read_sql("SELECT * FROM streaming_metrics_store WHERE id = 1;", conn)
 
@@ -122,9 +125,7 @@ def load_streaming_data():
             conn
         )
 
-        return metrics_df, events_df, municipal_df, dlq_df
-    finally:
-        conn.close()
+    return metrics_df, events_df, municipal_df, dlq_df
 
 
 # Sidebar Controls
@@ -272,3 +273,4 @@ else:
 if auto_refresh:
     time.sleep(refresh_rate)
     st.rerun()
+

@@ -106,7 +106,9 @@ def load_dimensional_warehouse(
 
     try:
         # Step 1: Re-create schema DDL (Atomic Transaction)
-        ddl_path = os.path.join(SQL_DIR, "create_dw.sql")
+        ddl_path = os.path.join(SQL_DIR, "01_create_dw.sql")
+        if not os.path.exists(ddl_path):
+            ddl_path = os.path.join(SQL_DIR, "create_dw.sql")
         execute_sql_file(ddl_path, conn, auto_commit=False)
 
         # Step 2: Load Dimensions first (Referential Integrity)
@@ -120,7 +122,9 @@ def load_dimensional_warehouse(
         bulk_copy_dataframe(tables["fact_violencia_intrafamiliar"], "fact_violencia_intrafamiliar", conn, auto_commit=False)
 
         # Step 4: Create Semantic Views
-        views_path = os.path.join(SQL_DIR, "bi_views.sql")
+        views_path = os.path.join(SQL_DIR, "03_bi_views.sql")
+        if not os.path.exists(views_path):
+            views_path = os.path.join(SQL_DIR, "bi_views.sql")
         execute_sql_file(views_path, conn, auto_commit=False)
 
         # Step 5: Post-Load SQL Reconciliation & Integrity Checks

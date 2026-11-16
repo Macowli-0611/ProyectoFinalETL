@@ -205,3 +205,4 @@ if __name__ == "__main__":
         max_events=args.count,
         inject_invalid=args.inject_invalid
     )
+
