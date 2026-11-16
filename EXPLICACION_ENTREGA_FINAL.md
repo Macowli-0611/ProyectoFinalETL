@@ -203,3 +203,4 @@ Le muestras en la consola cómo la prueba pasa demostrando que los datos corrupt
 * 🧪 **Pruebas de Resiliencia:** [`streaming/test_resilience.py`](streaming/test_resilience.py)
 * 🗄️ **Scripts de Base de Datos:** [`sql/01_create_dw.sql`](sql/01_create_dw.sql) y [`sql/02_create_streaming_store.sql`](sql/02_create_streaming_store.sql)
 * 🐳 **Infraestructura:** [`docker-compose.yaml`](docker-compose.yaml)
+
