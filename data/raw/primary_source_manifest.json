@@ -1,8 +1,8 @@
 {
   "source_name": "Reporte Delito Violencia Intrafamiliar - Policía Nacional (DIJIN)",
   "source_url": "https://www.datos.gov.co/api/views/vuyt-mqpw/rows.csv?accessType=DOWNLOAD",
-  "extraction_timestamp": "2026-11-15T21:22:52.304927",
-  "local_filepath": "/Users/usuario/Desktop/ProyectoFinalETL/Proyecto_etl_Final/data/raw/Reporte_Delito_Violencia_Intrafamiliar_Policía_Nacional_20260902.csv",
+  "extraction_timestamp": "2026-11-16T19:11:16.401966",
+  "local_filepath": "/opt/project/data/raw/Reporte_Delito_Violencia_Intrafamiliar_Policía_Nacional_20260902.csv",
   "sha256": "d0f1b7ea949ad48c4121c9431f9706d393c9f40bb6f96c44964970876d2618aa",
   "file_size_bytes": 65636096,
   "row_count": 704551,

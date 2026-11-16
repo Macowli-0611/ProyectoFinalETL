@@ -1,0 +1,78 @@
+
+================================================================================
+ EXPERIMENT 1: INVALID EVENTS -> DEAD-LETTER QUEUE
+================================================================================
+2026-11-16 14:16:18,711 [INFO] [KafkaProducer] Watermark: fecha=2026-01-01 orden=786636784 id_hecho=666352 (source: fact_violencia_intrafamiliar)
+2026-11-16 14:16:18,713 [INFO] [KafkaProducer] <BrokerConnection node_id=bootstrap-0 host=127.0.0.1:9092 <connecting> [IPv4 ('127.0.0.1', 9092)]>: connecting to 127.0.0.1:9092 [('127.0.0.1', 9092) IPv4]
+2026-11-16 14:16:18,713 [INFO] [KafkaProducer] Probing node bootstrap-0 broker version
+2026-11-16 14:16:18,713 [INFO] [KafkaProducer] <BrokerConnection node_id=bootstrap-0 host=127.0.0.1:9092 <connecting> [IPv4 ('127.0.0.1', 9092)]>: Connection complete.
+2026-11-16 14:16:18,821 [INFO] [KafkaProducer] Broker version identified as 2.6.0
+2026-11-16 14:16:18,822 [INFO] [KafkaProducer] Set configuration api_version=(2, 6, 0) to skip auto check_version requests on startup
+2026-11-16 14:16:18,822 [INFO] [KafkaProducer] Connected to Kafka 127.0.0.1:9092, topic 'violencia-intrafamiliar-events'. Mode: DW_REPLAY_SIMULATION
+2026-11-16 14:16:18,911 [INFO] [KafkaProducer] <BrokerConnection node_id=1 host=127.0.0.1:9092 <connecting> [IPv4 ('127.0.0.1', 9092)]>: connecting to 127.0.0.1:9092 [('127.0.0.1', 9092) IPv4]
+2026-11-16 14:16:18,912 [INFO] [KafkaProducer] <BrokerConnection node_id=1 host=127.0.0.1:9092 <connecting> [IPv4 ('127.0.0.1', 9092)]>: Connection complete.
+2026-11-16 14:16:18,912 [INFO] [KafkaProducer] <BrokerConnection node_id=bootstrap-0 host=127.0.0.1:9092 <connected> [IPv4 ('127.0.0.1', 9092)]>: Closing connection. 
+2026-11-16 14:16:18,931 [INFO] [KafkaProducer] Published #0001 dw-fact-666208 | key=05847 | URRAO (ANTIOQUIA) | fecha_hecho=2026-01-01 | FEMENINO ADULTOS | SIN EMPLEO DE ARMAS | victimas=2
+2026-11-16 14:16:18,931 [INFO] [KafkaProducer] Closing the Kafka producer with 9223372036.0 secs timeout.
+2026-11-16 14:16:18,931 [INFO] [KafkaProducer] <BrokerConnection node_id=1 host=127.0.0.1:9092 <connected> [IPv4 ('127.0.0.1', 9092)]>: Closing connection. 
+2026-11-16 14:16:18,932 [INFO] [KafkaProducer] Producer closed. Published 1 DW events (watermark now 2026-01-01 / 666208).
+>>> Before: {'eventos': 60, 'victimas': 271, 'invalidos': 0, 'duplicados': 0, 'dlq_rows': 0}
+>>> Published 1 contract-violating JSON + 1 non-JSON message
+>>> Published 1 valid DW event right after them
+    DLQ #2 p=1 off=16: Event contract validation failed: Expecting value: line 1 column 1 (char 0)
+    DLQ #1 p=1 off=15: Event contract validation failed: 17 validation errors for ViolenciaIntrafamiliarEvent
+event_id
+  String should have at 
+>>> After: {'eventos': 61, 'victimas': 273, 'invalidos': 2, 'duplicados': 0, 'dlq_rows': 2} | consumer alive=True
+>>> RESULT: PASS
+    evidence -> docs/evidence/streaming_experiment_1.json
+
+================================================================================
+ EXPERIMENT 2: CONSUMER INTERRUPTION AND BACKLOG RECOVERY
+================================================================================
+>>> Step 0 - baseline: {'eventos': 61, 'victimas': 273, 'invalidos': 2, 'duplicados': 0, 'dlq_rows': 2}, lag=0
+>>> Step 1 - stopping the consumer
+    docker stop etl_final_stream_consumer -> running=False
+2026-11-16 14:16:21,497 [INFO] [KafkaProducer] Watermark: fecha=2026-01-01 orden=799976544 id_hecho=666208 (source: fact_violencia_intrafamiliar)
+2026-11-16 14:16:21,499 [INFO] [KafkaProducer] <BrokerConnection node_id=bootstrap-0 host=127.0.0.1:9092 <connecting> [IPv4 ('127.0.0.1', 9092)]>: connecting to 127.0.0.1:9092 [('127.0.0.1', 9092) IPv4]
+2026-11-16 14:16:21,499 [INFO] [KafkaProducer] Probing node bootstrap-0 broker version
+2026-11-16 14:16:21,499 [INFO] [KafkaProducer] <BrokerConnection node_id=bootstrap-0 host=127.0.0.1:9092 <connecting> [IPv4 ('127.0.0.1', 9092)]>: Connection complete.
+2026-11-16 14:16:21,606 [INFO] [KafkaProducer] Broker version identified as 2.6.0
+2026-11-16 14:16:21,606 [INFO] [KafkaProducer] Set configuration api_version=(2, 6, 0) to skip auto check_version requests on startup
+2026-11-16 14:16:21,607 [INFO] [KafkaProducer] Connected to Kafka 127.0.0.1:9092, topic 'violencia-intrafamiliar-events'. Mode: DW_REPLAY_SIMULATION
+2026-11-16 14:16:21,646 [INFO] [KafkaProducer] <BrokerConnection node_id=1 host=127.0.0.1:9092 <connecting> [IPv4 ('127.0.0.1', 9092)]>: connecting to 127.0.0.1:9092 [('127.0.0.1', 9092) IPv4]
+2026-11-16 14:16:21,646 [INFO] [KafkaProducer] <BrokerConnection node_id=1 host=127.0.0.1:9092 <connecting> [IPv4 ('127.0.0.1', 9092)]>: Connection complete.
+2026-11-16 14:16:21,646 [INFO] [KafkaProducer] <BrokerConnection node_id=bootstrap-0 host=127.0.0.1:9092 <connected> [IPv4 ('127.0.0.1', 9092)]>: Closing connection. 
+2026-11-16 14:16:21,714 [INFO] [KafkaProducer] Published #0001 dw-fact-666441 | key=68689 | SAN VICENTE DE CHUCURÍ (SANTANDER) | fecha_hecho=2026-01-01 | FEMENINO ADULTOS | CONTUNDENTES | victimas=2
+2026-11-16 14:16:21,921 [INFO] [KafkaProducer] Published #0002 dw-fact-666297 | key=20750 | SAN DIEGO (CESAR) | fecha_hecho=2026-01-01 | FEMENINO ADULTOS | SIN EMPLEO DE ARMAS | victimas=1
+2026-11-16 14:16:22,133 [INFO] [KafkaProducer] Published #0003 dw-fact-666386 | key=52260 | EL TAMBO (NARIÑO) | fecha_hecho=2026-01-01 | FEMENINO ADULTOS | CONTUNDENTES | victimas=1
+2026-11-16 14:16:22,344 [INFO] [KafkaProducer] Published #0004 dw-fact-666242 | key=13244 | EL CARMEN DE BOLÍVAR (BOLÍVAR) | fecha_hecho=2026-01-01 | FEMENINO ADULTOS | CONTUNDENTES | victimas=1
+2026-11-16 14:16:22,559 [INFO] [KafkaProducer] Published #0005 dw-fact-666475 | key=76130 | CANDELARIA (VALLE) | fecha_hecho=2026-01-01 | MASCULINO ADULTOS | CONTUNDENTES | victimas=1
+2026-11-16 14:16:22,774 [INFO] [KafkaProducer] Published #0006 dw-fact-666331 | key=25817 | TOCANCIPÁ (CUNDINAMARCA) | fecha_hecho=2026-01-01 | FEMENINO ADULTOS | SIN EMPLEO DE ARMAS | victimas=1
+2026-11-16 14:16:22,984 [INFO] [KafkaProducer] Published #0007 dw-fact-666187 | key=05001 | MEDELLÍN (ANTIOQUIA) | fecha_hecho=2026-01-01 | FEMENINO ADULTOS | CONTUNDENTES | victimas=35
+2026-11-16 14:16:23,198 [INFO] [KafkaProducer] Published #0008 dw-fact-666420 | key=88001 | SAN ANDRÉS (SAN ANDRÉS) | fecha_hecho=2026-01-01 | FEMENINO ADULTOS | SIN EMPLEO DE ARMAS | victimas=2 [DEFICIT LEY 2126]
+2026-11-16 14:16:23,409 [INFO] [KafkaProducer] Published #0009 dw-fact-666276 | key=17001 | MANIZALES (CALDAS) | fecha_hecho=2026-01-01 | FEMENINO ADULTOS | SIN EMPLEO DE ARMAS | victimas=2 [DEFICIT LEY 2126]
+2026-11-16 14:16:23,621 [INFO] [KafkaProducer] Published #0010 dw-fact-666365 | key=47288 | FUNDACIÓN (MAGDALENA) | fecha_hecho=2026-01-01 | FEMENINO ADULTOS | SIN EMPLEO DE ARMAS | victimas=2
+2026-11-16 14:16:23,621 [INFO] [KafkaProducer] Closing the Kafka producer with 9223372036.0 secs timeout.
+2026-11-16 14:16:23,622 [INFO] [KafkaProducer] <BrokerConnection node_id=1 host=127.0.0.1:9092 <connected> [IPv4 ('127.0.0.1', 9092)]>: Closing connection. 
+2026-11-16 14:16:23,622 [INFO] [KafkaProducer] Producer closed. Published 10 DW events (watermark now 2026-01-01 / 666365).
+>>> Step 2 - publishing 10 DW events while the consumer is down
+>>> Step 3 - while down: metrics={'eventos': 61, 'victimas': 273, 'invalidos': 2, 'duplicados': 0, 'dlq_rows': 2} | consumer-group lag=10
+>>> Step 4 - restarting the consumer
+    docker start etl_final_stream_consumer -> running=True
+>>> Step 5 - after restart (3.2s): metrics={'eventos': 71, 'victimas': 321, 'invalidos': 2, 'duplicados': 0, 'dlq_rows': 2} | lag=0
+>>> RESULT: PASS
+    evidence -> docs/evidence/streaming_experiment_2.json
+
+================================================================================
+ EXPERIMENT 3: DUPLICATE DELIVERY (IDEMPOTENT SINK)
+================================================================================
+>>> Re-published already processed event dw-fact-666365
+>>> Before: {'eventos': 71, 'victimas': 321, 'invalidos': 2, 'duplicados': 0, 'dlq_rows': 2}
+>>> After:  {'eventos': 71, 'victimas': 321, 'invalidos': 2, 'duplicados': 1, 'dlq_rows': 2}
+>>> RESULT: PASS
+    evidence -> docs/evidence/streaming_experiment_3.json
+
+================================================================================
+ SUMMARY: Exp 1: PASS, Exp 2: PASS, Exp 3: PASS
+================================================================================

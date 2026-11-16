@@ -1,208 +1,221 @@
-"""Apache Kafka Producer for Domestic Violence Real-Time Event Simulation.
+"""Kafka producer: replays NEW fact rows of the Data Warehouse as events.
 
-Simulates the arrival of real-time police incident reports and Comisaría de Familia
-intakes across Colombian municipalities. Complies with Section 2.6 of the Project Rubric:
-- Uses dynamic, analytical variation (not repeated static KPI values).
-- Supports streaming replay and synthetic generation derived from the actual DANE geography and Ley 2126 deficits.
-- Signs every message with the formal Event Contract.
+How events are generated (SIMULATION, clearly identified)
+--------------------------------------------------------
+The DIJIN source is published as a historical file, so there is no live feed of
+police reports. To simulate their arrival, the producer reads
+``fact_violencia_intrafamiliar`` (joined with its dimensions) in chronological
+order (``fecha``; inside a day a deterministic pseudo-random order) and publishes one event per fact row - i.e. one
+aggregated daily report of a municipality for a victim cohort and aggression
+mechanism. Every event carries ``origen = "DW_REPLAY_SIMULATION"`` and the
+original incident date in ``fecha_hecho``.
+
+No repeated / unchanged publications
+------------------------------------
+A watermark (last ``fecha`` + replay order + ``id_hecho`` published) is persisted in
+``streaming_producer_checkpoint`` after each delivered event. A new run only
+publishes rows *after* the watermark, so the same fact is never re-published
+unless ``--reset`` is given explicitly. ``event_id = dw-fact-<id_hecho>`` is
+deterministic, so even a forced replay is de-duplicated by the consumer.
+
+Publication rate: ``--interval`` seconds between events (default 1 s), which
+emulates the operational cadence at which reports would reach a monitoring
+center.
+
+Usage
+-----
+    python streaming/producer.py --count 50 --interval 1
+    python streaming/producer.py --start-date 2026-01-01 --reset
+    python streaming/producer.py --inject-invalid      # every 10th message is malformed
 """
 
 import argparse
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import json
 import logging
 import os
-import random
 import sys
 import time
-from uuid import uuid4
 
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from kafka import KafkaProducer  # kafka-python-ng
 
 from streaming.contract import ViolenciaIntrafamiliarEvent
+from streaming.db import get_db_connection
 
-try:
-    from kafka import KafkaProducer
-except ImportError:
-    try:
-        from kafka_python_ng import KafkaProducer
-    except ImportError:
-        KafkaProducer = None
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [KafkaProducer] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [KafkaProducer] %(message)s")
 logger = logging.getLogger("KafkaProducer")
 
-# Colombian municipalities curated with Ley 2126 deficit and priority status
-MUNICIPALITIES_SEED = [
-    # Top Critical Deficit Municipalities (R7 Rank 1 & 2 Urgency)
-    {"dane": "54001", "muni": "CÚCUTA", "depto": "NORTE DE SANTANDER", "cat": "1", "deficit": True, "prio": "URGENTE"},
-    {"dane": "25754", "muni": "SOACHA", "depto": "CUNDINAMARCA", "cat": "1", "deficit": True, "prio": "URGENTE"},
-    {"dane": "23001", "muni": "MONTERÍA", "depto": "CÓRDOBA", "cat": "1", "deficit": True, "prio": "URGENTE"},
-    {"dane": "19001", "muni": "POPAYÁN", "depto": "CAUCA", "cat": "1", "deficit": True, "prio": "ALTA"},
-    {"dane": "05088", "muni": "BELLO", "depto": "ANTIOQUIA", "cat": "1", "deficit": True, "prio": "ALTA"},
-    {"dane": "68276", "muni": "FLORIDABLANCA", "depto": "SANTANDER", "cat": "1", "deficit": True, "prio": "ALTA"},
-    {"dane": "41001", "muni": "NEIVA", "depto": "HUILA", "cat": "1", "deficit": True, "prio": "ALTA"},
-    {"dane": "70001", "muni": "SINCELEJO", "depto": "SUCRE", "cat": "1", "deficit": True, "prio": "ALTA"},
+PRODUCER_ID = "dw_fact_replay"
+DEFAULT_START_DATE = "2026-01-01"  # most recent period loaded in the DW
 
-    # Major Metropolises (High Absolute Volume)
-    {"dane": "11001", "muni": "BOGOTÁ, D.C.", "depto": "BOGOTÁ D.C.", "cat": "ESPECIAL", "deficit": False, "prio": "CONFORME"},
-    {"dane": "05001", "muni": "MEDELLÍN", "depto": "ANTIOQUIA", "cat": "ESPECIAL", "deficit": False, "prio": "CONFORME"},
-    {"dane": "76001", "muni": "CALI", "depto": "VALLE DEL CAUCA", "cat": "ESPECIAL", "deficit": False, "prio": "CONFORME"},
-    {"dane": "08001", "muni": "BARRANQUILLA", "depto": "ATLÁNTICO", "cat": "ESPECIAL", "deficit": False, "prio": "CONFORME"},
-    {"dane": "68001", "muni": "BUCARAMANGA", "depto": "SANTANDER", "cat": "1", "deficit": False, "prio": "CONFORME"},
-    {"dane": "17001", "muni": "MANIZALES", "depto": "CALDAS", "cat": "1", "deficit": False, "prio": "CONFORME"},
-
-    # Intermediate Municipalities
-    {"dane": "52001", "muni": "PASTO", "depto": "NARIÑO", "cat": "1", "deficit": True, "prio": "ALTA"},
-    {"dane": "73001", "muni": "IBAGUÉ", "depto": "TOLIMA", "cat": "1", "deficit": False, "prio": "CONFORME"},
-    {"dane": "66001", "muni": "PEREIRA", "depto": "RISARALDA", "cat": "1", "deficit": False, "prio": "CONFORME"}
-]
-
-WEAPONS_PROFILE = [
-    {"medio": "SIN EMPLEO DE ARMAS", "letal": False, "weight": 60},
-    {"medio": "CONTUNDENTES", "letal": False, "weight": 20},
-    {"medio": "ARMA BLANCA / CORTOPUNZANTE", "letal": True, "weight": 14},
-    {"medio": "ARMA DE FUEGO", "letal": True, "weight": 6}
-]
-
-DEMOGRAPHICS_PROFILE = [
-    {"genero": "FEMENINO", "grupo": "ADULTOS", "menor": False, "weight": 65},
-    {"genero": "FEMENINO", "grupo": "ADOLESCENTES", "menor": True, "weight": 8},
-    {"genero": "FEMENINO", "grupo": "MENORES", "menor": True, "weight": 6},
-    {"genero": "MASCULINO", "grupo": "ADULTOS", "menor": False, "weight": 14},
-    {"genero": "MASCULINO", "grupo": "ADOLESCENTES", "menor": True, "weight": 4},
-    {"genero": "MASCULINO", "grupo": "MENORES", "menor": True, "weight": 3}
-]
+FACT_QUERY = """
+    SELECT f.id_hecho, t.fecha, g.codigo_dane_municipio, g.municipio, g.departamento,
+           g.categoria_municipio, (g.brecha_comisarias > 0) AS tiene_deficit,
+           v.genero, v.grupo_etario, v.es_menor_de_edad,
+           m.medio_agresion, m.es_arma_letal, f.cantidad_victimas
+    FROM fact_violencia_intrafamiliar f
+    JOIN dim_tiempo    t ON t.id_tiempo    = f.id_tiempo
+    JOIN dim_geografia g ON g.id_geografia = f.id_geografia
+    JOIN dim_victima   v ON v.id_victima   = f.id_victima
+    JOIN dim_medio     m ON m.id_medio     = f.id_medio
+    WHERE (t.fecha, (f.id_hecho * 2654435761) %% 4294967296, f.id_hecho) > (%s, %s, %s)
+    ORDER BY t.fecha, (f.id_hecho * 2654435761) %% 4294967296, f.id_hecho
+    LIMIT %s;
+"""
 
 
-def generate_event(event_id: str = None) -> ViolenciaIntrafamiliarEvent:
-    """Generates a realistic event that satisfies the formal Event Contract."""
-    muni_meta = random.choice(MUNICIPALITIES_SEED)
+def read_watermark(conn, start_date: str, reset: bool):
+    with conn.cursor() as cur:
+        if reset:
+            cur.execute("DELETE FROM streaming_producer_checkpoint WHERE producer_id = %s;", (PRODUCER_ID,))
+            conn.commit()
+        cur.execute(
+            "SELECT last_fecha, last_orden, last_id_hecho FROM streaming_producer_checkpoint WHERE producer_id = %s;",
+            (PRODUCER_ID,),
+        )
+        row = cur.fetchone()
+    if row:
+        return row[0], row[1], row[2]
+    # Start just before the first row of start_date
+    return date.fromisoformat(start_date), -1, 0
 
-    # Weighted choice for weapon
-    weapon_weights = [w["weight"] for w in WEAPONS_PROFILE]
-    weapon = random.choices(WEAPONS_PROFILE, weights=weapon_weights, k=1)[0]
 
-    # Weighted choice for demographics
-    demo_weights = [d["weight"] for d in DEMOGRAPHICS_PROFILE]
-    demo = random.choices(DEMOGRAPHICS_PROFILE, weights=demo_weights, k=1)[0]
+def replay_order(id_hecho: int) -> int:
+    """Deterministic pseudo-random order inside a day (Knuth multiplicative hash),
+    so the replay interleaves municipalities instead of following alphabetical ids."""
+    return (id_hecho * 2654435761) % 4294967296
 
-    # Number of victims (mostly 1, occasionally 2 or 3 in severe incidents)
-    victimas = random.choices([1, 2, 3], weights=[85, 12, 3], k=1)[0]
 
-    now_utc = datetime.now(timezone.utc)
-    evt_uuid = event_id or f"evt-{uuid4()}"
+def save_watermark(conn, fecha, id_hecho):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO streaming_producer_checkpoint
+                (producer_id, last_fecha, last_orden, last_id_hecho, published_total, updated_at)
+            VALUES (%s, %s, %s, %s, 1, now())
+            ON CONFLICT (producer_id) DO UPDATE SET
+                last_fecha = EXCLUDED.last_fecha,
+                last_orden = EXCLUDED.last_orden,
+                last_id_hecho = EXCLUDED.last_id_hecho,
+                published_total = streaming_producer_checkpoint.published_total + 1,
+                updated_at = now();
+            """,
+            (PRODUCER_ID, fecha, replay_order(id_hecho), id_hecho),
+        )
+    conn.commit()
 
-    event = ViolenciaIntrafamiliarEvent(
-        event_id=evt_uuid,
-        timestamp=now_utc,
-        event_key=muni_meta["dane"],
-        codigo_dane_municipio=muni_meta["dane"],
-        municipio=muni_meta["muni"],
-        departamento=muni_meta["depto"],
-        genero=demo["genero"],
-        grupo_etario=demo["grupo"],
-        es_menor_de_edad=demo["menor"],
-        medio_agresion=weapon["medio"],
-        es_arma_letal=weapon["letal"],
+
+def row_to_event(row) -> ViolenciaIntrafamiliarEvent:
+    (id_hecho, fecha, dane, muni, depto, cat, deficit, genero, grupo, menor, medio, letal, victimas) = row
+    return ViolenciaIntrafamiliarEvent(
+        event_id=f"dw-fact-{id_hecho}",
+        timestamp=datetime.now(timezone.utc),
+        event_key=dane,
+        origen="DW_REPLAY_SIMULATION",
+        id_hecho_origen=id_hecho,
+        fecha_hecho=fecha,
+        codigo_dane_municipio=dane,
+        municipio=muni,
+        departamento=depto,
+        genero=genero,
+        grupo_etario=grupo,
+        es_menor_de_edad=menor,
+        medio_agresion=medio,
+        es_arma_letal=letal,
         cantidad_victimas=victimas,
-        categoria_municipio=muni_meta["cat"],
-        tiene_deficit_ley_2126=muni_meta["deficit"]
+        categoria_municipio=cat,
+        tiene_deficit_ley_2126=deficit,
     )
-    return event
 
 
-def generate_invalid_event() -> dict:
-    """Generates a deliberately malformed payload to test resilience."""
+def malformed_payload(n: int) -> dict:
+    """Deliberately broken message used to demonstrate DLQ handling."""
     return {
-        "event_id": "malformed-short-id",  # Violates min_length
-        "timestamp": "invalid-timestamp-format",  # Violates datetime format
-        "event_key": "999",  # Not 5 digits
-        "codigo_dane_municipio": "INVALID",  # Non-numeric
-        "cantidad_victimas": -5,  # Violates gt=0
-        "genero": "UNKNOWN_VALUE"
+        "event_id": f"bad-{n}",          # too short
+        "timestamp": "not-a-timestamp",  # wrong type
+        "event_key": "999",              # not a DANE code
+        "cantidad_victimas": -5,         # must be > 0
+        "genero": "UNKNOWN_VALUE",
+        "campo_extra": True,             # extra fields are forbidden
     }
 
 
-def run_producer(
-    bootstrap_servers: str,
-    topic: str,
-    interval_seconds: float = 1.0,
-    max_events: int = 0,
-    inject_invalid: bool = False
-):
-    """Initializes KafkaProducer and emits simulated events."""
-    logger.info(f"Connecting to Kafka broker at '{bootstrap_servers}'...")
-
-    if KafkaProducer is None:
-        raise RuntimeError("Neither 'kafka-python' nor 'kafka-python-ng' is installed.")
-
-    producer = KafkaProducer(
-        bootstrap_servers=bootstrap_servers.split(","),
+def build_producer(servers: str) -> KafkaProducer:
+    return KafkaProducer(
+        bootstrap_servers=servers.split(","),
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         key_serializer=lambda k: k.encode("utf-8") if k else None,
+        acks="all",
         retries=5,
-        acks="all"
     )
 
-    logger.info(f"Connected to Kafka. Publishing to topic '{topic}'...")
 
-    count = 0
+def run_producer(servers, topic, interval, max_events, start_date, reset, inject_invalid):
+    conn = get_db_connection()
+    last_fecha, last_orden, last_id = read_watermark(conn, start_date, reset)
+    logger.info("Watermark: fecha=%s orden=%s id_hecho=%s (source: fact_violencia_intrafamiliar)",
+                last_fecha, last_orden, last_id)
+
+    producer = build_producer(servers)
+    logger.info("Connected to Kafka %s, topic '%s'. Mode: DW_REPLAY_SIMULATION", servers, topic)
+
+    published = 0
+    sent_messages = 0
     try:
-        while True:
-            count += 1
-
-            if inject_invalid and count % 10 == 0:
-                # Deliberately inject invalid event for testing
-                invalid_data = generate_invalid_event()
-                logger.warning(f"Injecting deliberately malformed event #{count} to topic '{topic}'...")
-                producer.send(topic, key=invalid_data.get("event_key", "00000"), value=invalid_data)
-                producer.flush()
-            else:
-                event = generate_event()
-                payload = event.to_kafka_dict()
-                producer.send(topic, key=event.event_key, value=payload)
-                producer.flush()
-
-                alert_flag = "[DEFICIT ALERT]" if event.tiene_deficit_ley_2126 else ""
-                lethal_flag = "[LETHAL]" if event.es_arma_letal else ""
-                minor_flag = "[CHILD VICTIM]" if event.es_menor_de_edad else ""
-                logger.info(
-                    f"Published #{count:04d} | Key={event.event_key} | {event.municipio} ({event.departamento}) "
-                    f"| {event.genero} {event.grupo_etario} | {event.medio_agresion} {lethal_flag} {minor_flag} {alert_flag}"
-                )
-
-            if max_events > 0 and count >= max_events:
-                logger.info(f"Published target total of {max_events} events. Exiting.")
+        while max_events == 0 or published < max_events:
+            batch = 500 if max_events == 0 else min(500, max_events - published)
+            with conn.cursor() as cur:
+                cur.execute(FACT_QUERY, (last_fecha, last_orden, last_id, batch))
+                rows = cur.fetchall()
+            if not rows:
+                logger.info("No new fact rows after the watermark. Nothing else to publish.")
                 break
 
-            time.sleep(interval_seconds)
+            for row in rows:
+                sent_messages += 1
+                if inject_invalid and sent_messages % 10 == 0:
+                    bad = malformed_payload(sent_messages)
+                    producer.send(topic, key="00000", value=bad).get(timeout=30)
+                    logger.warning("Injected malformed message #%d (expected to land in the DLQ)", sent_messages)
+                    time.sleep(interval)
 
+                event = row_to_event(row)
+                producer.send(topic, key=event.event_key, value=event.to_kafka_dict()).get(timeout=30)
+                save_watermark(conn, event.fecha_hecho, event.id_hecho_origen)
+                last_fecha, last_id = event.fecha_hecho, event.id_hecho_origen
+                last_orden = replay_order(last_id)
+                published += 1
+                logger.info(
+                    "Published #%04d %s | key=%s | %s (%s) | fecha_hecho=%s | %s %s | %s%s | victimas=%d%s",
+                    published, event.event_id, event.event_key, event.municipio, event.departamento,
+                    event.fecha_hecho, event.genero, event.grupo_etario, event.medio_agresion,
+                    " [LETAL]" if event.es_arma_letal else "", event.cantidad_victimas,
+                    " [DEFICIT LEY 2126]" if event.tiene_deficit_ley_2126 else "",
+                )
+                if max_events and published >= max_events:
+                    break
+                time.sleep(interval)
     except KeyboardInterrupt:
-        logger.info("Producer interrupted by user. Shutting down gracefully.")
+        logger.info("Producer interrupted by user.")
     finally:
+        producer.flush()
         producer.close()
-        logger.info("Kafka producer closed.")
+        conn.close()
+        logger.info("Producer closed. Published %d DW events (watermark now %s / %s).", published, last_fecha, last_id)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Domestic Violence Streaming Producer")
-    parser.add_argument("--servers", default=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"), help="Kafka bootstrap servers")
-    parser.add_argument("--topic", default=os.getenv("KAFKA_TOPIC_VIOLENCIA", "violencia-intrafamiliar-events"), help="Kafka topic")
-    parser.add_argument("--interval", type=float, default=1.0, help="Interval between events in seconds")
-    parser.add_argument("--count", type=int, default=0, help="Number of events to emit (0 for continuous)")
-    parser.add_argument("--inject-invalid", action="store_true", help="Inject malformed events periodically for resilience testing")
-
-    args = parser.parse_args()
-    run_producer(
-        bootstrap_servers=args.servers,
-        topic=args.topic,
-        interval_seconds=args.interval,
-        max_events=args.count,
-        inject_invalid=args.inject_invalid
-    )
-
+    p = argparse.ArgumentParser(description="Replays new DW fact rows as Kafka events (simulation)")
+    p.add_argument("--servers", default=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092"))
+    p.add_argument("--topic", default=os.getenv("KAFKA_TOPIC_VIOLENCIA", "violencia-intrafamiliar-events"))
+    p.add_argument("--interval", type=float, default=1.0, help="Seconds between events")
+    p.add_argument("--count", type=int, default=0, help="Events to publish (0 = until the DW is exhausted)")
+    p.add_argument("--start-date", default=DEFAULT_START_DATE, help="Replay start when there is no checkpoint")
+    p.add_argument("--reset", action="store_true", help="Discard the checkpoint and start from --start-date")
+    p.add_argument("--inject-invalid", action="store_true", help="Every 10th message is malformed")
+    a = p.parse_args()
+    run_producer(a.servers, a.topic, a.interval, a.count, a.start_date, a.reset, a.inject_invalid)

@@ -1,0 +1,8 @@
+2026-11-16 19:15:34,197 [INFO] [KafkaConsumer] [OK #0003] p=1 off=1 dw-fact-666431 | FLORIDABLANCA (SANTANDER) | victimas=1 DEFICIT
+2026-11-16 19:16:18,544 [WARNING] [KafkaConsumer] [DLQ] partition=1 offset=15 key=00000 -> Event contract validation failed: 17 validation errors for ViolenciaIntrafamiliarEvent
+2026-11-16 19:16:18,550 [WARNING] [KafkaConsumer] [DLQ] partition=1 offset=16 key=00000 -> Event contract validation failed: Expecting value: line 1 column 1 (char 0)
+2026-11-16 19:16:31,688 [INFO] [KafkaConsumer] Subscribed to 'violencia-intrafamiliar-events' as group 'etl_streaming_group' (bootstrap kafka:29092). Waiting for events...
+2026-11-16 19:16:31,811 [INFO] [KafkaConsumer] [OK #0001] p=1 off=18 dw-fact-666441 | SAN VICENTE DE CHUCURÍ (SANTANDER) | victimas=2
+2026-11-16 19:16:31,813 [INFO] [KafkaConsumer] [OK #0002] p=1 off=19 dw-fact-666475 | CANDELARIA (VALLE) | victimas=1
+2026-11-16 19:16:31,815 [INFO] [KafkaConsumer] [OK #0003] p=0 off=15 dw-fact-666242 | EL CARMEN DE BOLÍVAR (BOLÍVAR) | victimas=1
+2026-11-16 19:16:33,482 [INFO] [KafkaConsumer] [DUPLICATE] dw-fact-666365 already processed - metrics unchanged

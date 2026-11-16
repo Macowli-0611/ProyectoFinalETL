@@ -1,0 +1,15 @@
+            tabla             | filas  | victimas | registros 
+------------------------------+--------+----------+-----------
+ fact_violencia_intrafamiliar | 701714 |  1501809 |    704551
+ dim_tiempo                   |   6056 |          |          
+ dim_geografia                |   1113 |          |          
+ dim_victima                  |     11 |          |          
+ dim_medio                    |      6 |          |          
+ dim_comisaria                |   1247 |          |          
+(6 rows)
+
+ huerfanos_geo | duplicados_grano |    ultima_carga     
+---------------+------------------+---------------------
+             0 |                0 | 2026-11-16 19:11:20
+(1 row)
+

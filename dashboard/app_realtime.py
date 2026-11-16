@@ -1,276 +1,175 @@
-"""Real-Time Streaming Dashboard (Streamlit & Plotly).
+"""Real-time dashboard (Streamlit + Plotly) for the streaming layer.
 
-Connects to PostgreSQL streaming store (streaming_metrics_store, streaming_events_log,
-and streaming_municipal_metrics) with configurable auto-refresh to visualize:
-  - Metric 1: Real-time operational volume (events & victims)
-  - Metric 2: Lethality rate & child victim proportion
-  - Metric 3: Institutional deficit saturation alerts (Ley 2126)
-  - Audit log and Dead-Letter Queue (DLQ) health status
+Consumer -> dashboard integration: the Kafka consumer commits every processed
+event and the updated metrics to PostgreSQL (streaming_metrics_store,
+streaming_events_log, streaming_municipal_metrics, streaming_invalid_events_log).
+This page re-queries those tables every N seconds (default 3 s, sidebar slider)
+using an auto-refreshing Streamlit fragment, so a new event is visible at most
+N seconds after the consumer commits it.
 
-Complies with Section 2.7 of the Final Project Rubric.
+It is intentionally different from the Power BI batch dashboard: it only shows
+what arrived through Kafka since the streaming store was (re)created - volume,
+severity and institutional pressure *right now* - not the 2010-2026 history.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 import os
-import time
+import sys
 
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
-import psycopg2
 import streamlit as st
-
-import sqlalchemy
 from sqlalchemy import create_engine
+from sqlalchemy.engine import URL
 
-# Page configuration
-st.set_page_config(
-    page_title="Streaming ETL — Violencia Intrafamiliar & Déficit Institucional",
-    page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+from streaming.db import db_params  # noqa: E402
 
-# Custom CSS for styling
-st.markdown("""
-<style>
-    .metric-card {
-        background-color: #1e222d;
-        border-radius: 10px;
-        padding: 15px;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
-        border-left: 5px solid #ff4b4b;
-    }
-    .status-badge-crit {
-        background-color: #d32f2f;
-        color: white;
-        padding: 4px 10px;
-        border-radius: 4px;
-        font-weight: bold;
-    }
-    .status-badge-ok {
-        background-color: #388e3c;
-        color: white;
-        padding: 4px 10px;
-        border-radius: 4px;
-        font-weight: bold;
-    }
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="Streaming - Violencia intrafamiliar", page_icon="⚡", layout="wide")
 
 
 @st.cache_resource
-def get_db_engine():
-    host = os.getenv("DB_HOST", "localhost")
-    port = int(os.getenv("DB_PORT", 5432))
-    dbname = os.getenv("DB_NAME", "etl_dw")
-    user = os.getenv("DB_USER", "postgres")
-    password = os.getenv("DB_PASSWORD", "postgres123")
-    url = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
-    return create_engine(url, pool_pre_ping=True)
+def engine():
+    p = db_params()
+    url = URL.create("postgresql+psycopg2", username=p["user"], password=p["password"],
+                     host=p["host"], port=p["port"], database=p["dbname"])
+    return create_engine(url, pool_pre_ping=True, pool_size=2)
 
 
-def load_streaming_data():
-    engine = get_db_engine()
-    with engine.connect() as conn:
-        # 1. Global KPIs
-        metrics_df = pd.read_sql("SELECT * FROM streaming_metrics_store WHERE id = 1;", conn)
-
-        # 2. Recent Events Audit Log (Top 15)
-        events_df = pd.read_sql(
-            """
-            SELECT
-                event_id,
-                to_char(event_timestamp, 'HH24:MI:SS') as hora,
-                municipio,
-                departamento,
-                genero,
-                grupo_etario,
-                medio_agresion,
-                es_arma_letal,
-                cantidad_victimas,
-                tiene_deficit_ley_2126
-            FROM streaming_events_log
-            ORDER BY id DESC
-            LIMIT 15;
-            """,
-            conn
-        )
-
-        # 3. Municipal Ranking
-        municipal_df = pd.read_sql(
-            """
-            SELECT
-                municipio,
-                departamento,
-                victimas_recientes,
-                casos_arma_letal,
-                victimas_menores,
-                tiene_deficit_ley_2126
-            FROM streaming_municipal_metrics
-            ORDER BY victimas_recientes DESC
-            LIMIT 10;
-            """,
-            conn
-        )
-
-        # 4. Dead-Letter Queue (DLQ)
-        dlq_df = pd.read_sql(
-            """
-            SELECT id, event_key, error_reason, to_char(received_at, 'HH24:MI:SS') as hora_rechazo
-            FROM streaming_invalid_events_log
-            ORDER BY id DESC
-            LIMIT 5;
-            """,
-            conn
-        )
-
-    return metrics_df, events_df, municipal_df, dlq_df
+def q(sql: str) -> pd.DataFrame:
+    with engine().connect() as conn:
+        return pd.read_sql(sql, conn)
 
 
-# Sidebar Controls
-st.sidebar.title("⚡ Control de Streaming")
-st.sidebar.markdown("**Pipeline:** Apache Kafka ➔ Consumer ➔ PostgreSQL 16")
-refresh_rate = st.sidebar.slider("Intervalo de Refresco (segundos)", min_value=1, max_value=10, value=3)
-auto_refresh = st.sidebar.checkbox("Auto-refresco activo", value=True)
+# ----------------------------------------------------------------------------- sidebar
+st.sidebar.title("⚡ Streaming")
+refresh = st.sidebar.slider("Intervalo de refresco (s)", 1, 10, 3)
+st.sidebar.markdown(
+    """
+**Flujo:** Producer (réplica del DW) → Kafka `violencia-intrafamiliar-events`
+(3 particiones, key = DANE) → Consumer (contrato v2) → PostgreSQL → este tablero.
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 📋 Arquitectura de Streaming")
-st.sidebar.info("""
-- **Tópico Kafka:** `violencia-intrafamiliar-events`
-- **Contrato:** `ViolenciaIntrafamiliarEvent` (Pydantic V2)
-- **Persistencia:** Tabla `streaming_metrics_store`
-- **DLQ:** Tabla `streaming_invalid_events_log`
-""")
+**Origen de eventos:** filas de `fact_violencia_intrafamiliar` reproducidas en orden
+cronológico — *simulación* de llegada (`origen = DW_REPLAY_SIMULATION`).
 
-# Main Header
-st.title("⚡ Tablero en Tiempo Real: Violencia Intrafamiliar & Sobrecarga Institucional")
-st.caption("Visualización de baja latencia alimentada continuamente por eventos Kafka validados contra el Contrato Formal de Eventos.")
+**Diferencia con Power BI:** Power BI analiza la historia 2010-2026 del DW;
+este tablero sólo muestra lo que llega por Kafka y cambia con cada evento.
+"""
+)
 
-try:
-    metrics_df, events_df, municipal_df, dlq_df = load_streaming_data()
-    m = metrics_df.iloc[0] if not metrics_df.empty else None
-except Exception as e:
-    st.error(f"⚠️ Error conectando con la base de datos de streaming: {e}")
-    st.info("Asegúrese de que el contenedor 'postgres_dw' y las tablas de streaming estén inicializadas.")
-    st.stop()
+st.title("Tablero en tiempo real — violencia intrafamiliar y presión institucional")
 
-# Top 3 Streaming Metrics Display
-if m is not None:
-    col1, col2, col3, col4 = st.columns(4)
 
-    with col1:
-        st.metric(
-            label="Métrica 1: Eventos Procesados",
-            value=f"{m['total_eventos_procesados']:,}",
-            delta=f"{m['total_victimas_procesadas']} víctimas totales"
-        )
+@st.fragment(run_every=refresh)
+def live():
+    try:
+        m = q("SELECT * FROM streaming_metrics_store WHERE id = 1;").iloc[0]
+    except Exception as e:  # noqa: BLE001
+        st.error(f"No se pudo leer el streaming store: {e}")
+        return
 
-    with col2:
-        st.metric(
-            label="Métrica 2a: Tasa de Letalidad",
-            value=f"{m['tasa_letalidad_pct']:.1f}%",
-            delta=f"{m['total_casos_arma_letal']} armas letales",
-            delta_color="inverse"
-        )
-
-    with col3:
-        st.metric(
-            label="Métrica 2b: Afectación a Menores",
-            value=f"{m['tasa_menores_pct']:.1f}%",
-            delta=f"{m['total_victimas_menores']} niños/adolescentes",
-            delta_color="inverse"
-        )
-
-    with col4:
-        presion = m['indice_presion_operativa']
-        badge_color = "status-badge-crit" if "CRÍTICA" in presion or "ALTA" in presion else "status-badge-ok"
-        st.metric(
-            label="Métrica 3: Alertas Déficit Ley 2126",
-            value=f"{m['total_alertas_deficit_ley2126']:,}",
-            delta=f"Estado: {presion}",
-            delta_color="off"
-        )
-
-st.markdown("---")
-
-# Visual Analytics Row
-chart_col1, chart_col2 = st.columns([6, 4])
-
-with chart_col1:
-    st.subheader("📍 Top Municipios con Mayor Volumen en Vivo")
-    if not municipal_df.empty:
-        fig_bar = px.bar(
-            municipal_df,
-            x="victimas_recientes",
-            y="municipio",
-            color="tiene_deficit_ley_2126",
-            orientation="h",
-            color_discrete_map={True: "#e53935", False: "#1e88e5"},
-            labels={
-                "victimas_recientes": "Víctimas Recientes",
-                "municipio": "Municipio",
-                "tiene_deficit_ley_2126": "¿Déficit Ley 2126?"
-            },
-            title="Víctimas Recientes por Municipio (Rojo = Déficit Estatutario de Comisarías)",
-            template="plotly_dark"
-        )
-        fig_bar.update_layout(yaxis={'categoryorder': 'total ascending'}, height=350, margin=dict(l=10, r=10, t=40, b=10))
-        st.plotly_chart(fig_bar, use_container_width=True)
-    else:
-        st.info("Esperando eventos para generar el ranking municipal...")
-
-with chart_col2:
-    st.subheader("⚖️ Distribución de Vulnerabilidad en Vivo")
-    if m is not None and m['total_victimas_procesadas'] > 0:
-        labels = ['Mujeres Adultas', 'Menores de Edad', 'Hombres Adultos']
-        mujeres_adultas = max(0, m['total_victimas_mujeres'] - m['total_victimas_menores'])
-        values = [mujeres_adultas, m['total_victimas_menores'], max(0, m['total_victimas_procesadas'] - m['total_victimas_mujeres'])]
-        fig_donut = px.pie(
-            names=labels,
-            values=values,
-            hole=0.5,
-            color_discrete_sequence=['#8e24aa', '#fb8c00', '#039be5'],
-            template="plotly_dark",
-            title="Cohortes Demográficas Afectadas"
-        )
-        fig_donut.update_layout(height=350, margin=dict(l=10, r=10, t=40, b=10))
-        st.plotly_chart(fig_donut, use_container_width=True)
-    else:
-        st.info("Esperando eventos para la distribución...")
-
-# Feed of Live Incoming Events
-st.subheader("📋 Flujo de Eventos Entrantes (Últimos 15 procesados)")
-if not events_df.empty:
-    st.dataframe(
-        events_df,
-        column_config={
-            "hora": "Hora UTC",
-            "municipio": "Municipio",
-            "departamento": "Departamento",
-            "genero": "Género",
-            "grupo_etario": "Ciclo Vital",
-            "medio_agresion": "Mecanismo",
-            "es_arma_letal": st.column_config.CheckboxColumn("¿Arma Letal?"),
-            "cantidad_victimas": "Víctimas",
-            "tiene_deficit_ley_2126": st.column_config.CheckboxColumn("¿Déficit Ley 2126?"),
-        },
-        hide_index=True,
-        use_container_width=True
+    now = datetime.now(timezone.utc)
+    st.caption(
+        f"Última consulta: {now:%H:%M:%S} UTC · último evento procesado: "
+        f"{m['ultimo_evento_id'] or '—'} ({m['ultimo_municipio_reportado'] or '—'}) · "
+        f"refresco cada {refresh} s"
     )
-else:
-    st.info("No se han recibido eventos todavía. Ejecute el productor para emitir registros.")
 
-# Dead-Letter Queue (Resilience Proof)
-st.subheader("🛡️ Resiliencia & Dead-Letter Queue (Eventos Malformados Rechazados)")
-if not dlq_df.empty:
-    st.warning("Se han detectado eventos que violaron el Contrato Formal de Eventos. El consumidor los aisló sin colapsar:")
-    st.dataframe(dlq_df, hide_index=True, use_container_width=True)
-else:
-    st.success("✅ Cero fallas en cola de eventos muertos. Todos los eventos procesados cumplen el contrato formal.")
+    # ------------------------------------------------------------ 3 streaming metrics
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Métrica 1 · Eventos procesados", f"{int(m['total_eventos_procesados']):,}",
+              f"{int(m['total_victimas_procesadas']):,} víctimas", delta_color="off")
+    c2.metric("Métrica 2 · Eventos con arma letal", f"{float(m['tasa_letalidad_pct']):.1f} %",
+              f"{int(m['total_casos_arma_letal']):,} casos", delta_color="off")
+    c3.metric("Métrica 2 · Víctimas menores de edad", f"{float(m['tasa_menores_pct']):.1f} %",
+              f"{int(m['total_victimas_menores']):,} niñas, niños y adolescentes", delta_color="off")
+    estado = m["indice_presion_operativa"]
+    icon = {"NORMAL": "🟢", "ALTA": "🟠", "CRITICA": "🔴"}.get(estado, "⚪")
+    c4.metric("Métrica 3 · Presión institucional",
+              f"{icon} {estado}", f"{float(m['pct_eventos_deficit_ventana']):.0f} % de los últimos 50 en municipios con déficit",
+              delta_color="off")
 
-# Auto-refresh loop
-if auto_refresh:
-    time.sleep(refresh_rate)
-    st.rerun()
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric("Víctimas mujeres", f"{float(m['tasa_mujeres_pct']):.1f} %")
+    h2.metric("Latencia media publicación → BD", f"{float(m['latencia_promedio_ms']):,.0f} ms")
+    h3.metric("Eventos rechazados (DLQ)", f"{int(m['total_eventos_invalidos']):,}")
+    h4.metric("Duplicados descartados", f"{int(m['total_duplicados_descartados']):,}")
 
+    st.divider()
+
+    # ------------------------------------------------------------ charts
+    left, right = st.columns([3, 2])
+    with left:
+        rate = q("""
+            SELECT to_timestamp(floor(extract(epoch FROM processed_at) / 10) * 10) AT TIME ZONE 'UTC' AS ventana,
+                   count(*) AS eventos, sum(cantidad_victimas) AS victimas,
+                   sum(CASE WHEN es_arma_letal THEN 1 ELSE 0 END) AS letales
+            FROM streaming_events_log
+            WHERE processed_at > now() - interval '10 minutes'
+            GROUP BY 1 ORDER BY 1;
+        """)
+        st.subheader("Eventos procesados por ventana de 10 s (últimos 10 min)")
+        if rate.empty:
+            st.info("Sin eventos en los últimos 10 minutos. Ejecute el productor.")
+        else:
+            fig = px.bar(rate, x="ventana", y="eventos", hover_data=["victimas", "letales"],
+                         labels={"ventana": "Hora (UTC)", "eventos": "Eventos"})
+            fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+    with right:
+        st.subheader("Top municipios en vivo")
+        mun = q("""SELECT municipio, victimas_recientes, casos_arma_letal,
+                          CASE WHEN tiene_deficit_ley_2126 THEN 'Con déficit Ley 2126' ELSE 'Sin déficit' END AS deficit
+                   FROM streaming_municipal_metrics ORDER BY victimas_recientes DESC, ultima_alerta DESC LIMIT 10;""")
+        if mun.empty:
+            st.info("Esperando eventos…")
+        else:
+            fig = px.bar(mun, x="victimas_recientes", y="municipio", color="deficit", orientation="h",
+                         color_discrete_map={"Con déficit Ley 2126": "#d64545", "Sin déficit": "#3b7dd8"},
+                         labels={"victimas_recientes": "Víctimas", "municipio": "", "deficit": ""})
+            fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10),
+                              yaxis={"categoryorder": "total ascending"}, legend=dict(orientation="h", y=-0.2))
+            st.plotly_chart(fig, use_container_width=True)
+
+    a, b = st.columns(2)
+    with a:
+        st.subheader("Víctimas por cohorte")
+        coh = q("""SELECT genero || ' · ' || CASE WHEN es_menor_de_edad THEN 'menor' ELSE 'adulto' END AS cohorte,
+                          sum(cantidad_victimas) AS victimas
+                   FROM streaming_events_log GROUP BY 1 ORDER BY 2 DESC;""")
+        if not coh.empty:
+            fig = px.pie(coh, names="cohorte", values="victimas", hole=0.5)
+            fig.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+    with b:
+        st.subheader("Mecanismo de agresión")
+        med = q("""SELECT medio_agresion, count(*) AS eventos FROM streaming_events_log
+                   GROUP BY 1 ORDER BY 2 DESC;""")
+        if not med.empty:
+            fig = px.bar(med, x="eventos", y="medio_agresion", orientation="h",
+                         labels={"eventos": "Eventos", "medio_agresion": ""})
+            fig.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10),
+                              yaxis={"categoryorder": "total ascending"})
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Últimos 15 eventos procesados")
+    feed = q("""SELECT to_char(processed_at AT TIME ZONE 'UTC', 'HH24:MI:SS') AS procesado_utc, event_id,
+                       fecha_hecho, municipio, departamento, genero, grupo_etario, medio_agresion,
+                       es_arma_letal, cantidad_victimas, tiene_deficit_ley_2126, kafka_partition, latencia_ms
+                FROM streaming_events_log ORDER BY id DESC LIMIT 15;""")
+    st.dataframe(feed, hide_index=True, use_container_width=True)
+
+    st.subheader("Dead-Letter Queue (eventos que violan el contrato)")
+    dlq = q("""SELECT id, to_char(received_at AT TIME ZONE 'UTC', 'HH24:MI:SS') AS recibido_utc, event_key,
+                      kafka_partition, kafka_offset, left(error_reason, 220) AS motivo
+               FROM streaming_invalid_events_log ORDER BY id DESC LIMIT 5;""")
+    if dlq.empty:
+        st.success("Sin eventos rechazados.")
+    else:
+        st.dataframe(dlq, hide_index=True, use_container_width=True)
+
+
+live()

@@ -31,7 +31,7 @@ DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DB_NAME = os.getenv("DB_NAME", "etl_dw")
 DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres123")
+DB_PASSWORD = os.getenv("DB_PASSWORD")  # required, never hard-coded
 
 SQL_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "sql")
 EVIDENCE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "docs", "evidence")
@@ -89,14 +89,14 @@ def load_dimensional_warehouse(
     """Loads all dimensions and facts into PostgreSQL in a single atomic transaction.
 
     Execution order:
-      1. Schema DDL re-creation (create_dw.sql)
+      1. Schema DDL re-creation (01_create_dw.sql)
       2. dim_tiempo
       3. dim_geografia
       4. dim_victima
       5. dim_medio
       6. dim_comisaria
       7. fact_violencia_intrafamiliar
-      8. Semantic Views (bi_views.sql)
+      8. Semantic Views (03_bi_views.sql)
       9. Automated Reconciliation & Foreign Key orphan check
       10. Atomic COMMIT on 100% success; ROLLBACK on any failure.
     """
@@ -107,8 +107,6 @@ def load_dimensional_warehouse(
     try:
         # Step 1: Re-create schema DDL (Atomic Transaction)
         ddl_path = os.path.join(SQL_DIR, "01_create_dw.sql")
-        if not os.path.exists(ddl_path):
-            ddl_path = os.path.join(SQL_DIR, "create_dw.sql")
         execute_sql_file(ddl_path, conn, auto_commit=False)
 
         # Step 2: Load Dimensions first (Referential Integrity)
@@ -123,8 +121,6 @@ def load_dimensional_warehouse(
 
         # Step 4: Create Semantic Views
         views_path = os.path.join(SQL_DIR, "03_bi_views.sql")
-        if not os.path.exists(views_path):
-            views_path = os.path.join(SQL_DIR, "bi_views.sql")
         execute_sql_file(views_path, conn, auto_commit=False)
 
         # Step 5: Post-Load SQL Reconciliation & Integrity Checks

@@ -1,0 +1,20 @@
+{
+  "experiment": "duplicate delivery",
+  "executed_at": "2026-11-16 19:16:33.505321+00:00",
+  "event_id": "dw-fact-666365",
+  "before": {
+    "eventos": 71,
+    "victimas": 321,
+    "invalidos": 2,
+    "duplicados": 0,
+    "dlq_rows": 2
+  },
+  "after": {
+    "eventos": 71,
+    "victimas": 321,
+    "invalidos": 2,
+    "duplicados": 1,
+    "dlq_rows": 2
+  },
+  "result": "PASS"
+}

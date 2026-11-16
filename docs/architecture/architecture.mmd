@@ -1,0 +1,38 @@
+flowchart TB
+    subgraph SRC["1 · Data sources"]
+        direction LR
+        D1[("DIJIN CSV · Policía Nacional<br/>704,551 rows · 2010-2026")]
+        D2["SODA REST API · MinJusticia<br/>1,249 Comisarías de Familia"]
+    end
+
+    subgraph AF["2 · Batch ETL · Apache Airflow 3.1.8 · DAG etl_violencia_intrafamiliar_final (@daily)"]
+        direction LR
+        E1["extract_primary"] --> G1{"GX gate 1"}
+        E2["extract_api"] --> G2{"GX gate 2"}
+        G1 & G2 --> TR["transform_and_<br/>clean_and_integrate"] --> G3{"GX gate 3"} --> LD["load_dimensional_dw"]
+    end
+
+    subgraph PG["3 · PostgreSQL 16"]
+        direction LR
+        DW[("Data Warehouse · star schema<br/>fact_violencia_intrafamiliar + 5 dims + BI views")]
+        SS[("Streaming store<br/>metrics · events log · DLQ · ranking · checkpoint")]
+    end
+
+    subgraph KF["4 · Streaming · Apache Kafka 3.7 KRaft"]
+        direction LR
+        PR["Producer<br/>replays new fact rows"] --> TP{{"violencia-intrafamiliar-events<br/>3 partitions · key = DANE"}} --> CO["Consumer<br/>contract v2 · DLQ · idempotent"]
+    end
+
+    subgraph VIZ["5 · Dashboards"]
+        direction LR
+        PBI["Power BI · historical R1-R7"]
+        RT["Streamlit · real time · 3 s"]
+    end
+
+    D1 --> E1
+    D2 --> E2
+    LD --> DW
+    DW --> PBI
+    DW --> PR
+    CO --> SS
+    SS --> RT

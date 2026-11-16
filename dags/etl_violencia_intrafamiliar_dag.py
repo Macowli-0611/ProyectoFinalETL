@@ -1,4 +1,4 @@
-"""Apache Airflow 3.1.8 DAG: Pipeline Automation, API Integration & Data Validation.
+"""Apache Airflow 3.1.8 DAG (Final Delivery): batch ETL with GX quality gates.
 
 Orchestrates the domestic violence ETL pipeline following Apache Airflow 3.1.8 Task SDK:
   - Branch 1: extract_primary >> validate_primary_raw
@@ -66,10 +66,13 @@ default_args = {
 
 
 @dag(
-    dag_id="etl_violencia_intrafamiliar_segunda_entrega",
+    dag_id="etl_violencia_intrafamiliar_final",
     default_args=default_args,
     description="Automated ETL Pipeline: Domestic Violence + MinJusticia Comisarías de Familia API",
-    schedule=None,  # Triggered on-demand or external event
+    # Periodic batch extraction: the DIJIN file and the SODA API are refreshed once a day.
+    # Manual triggers (with the test_mode param) are still available from the UI.
+    schedule="@daily",
+    max_active_runs=1,
     start_date=datetime(2026, 1, 1),
     catchup=False,
     params={

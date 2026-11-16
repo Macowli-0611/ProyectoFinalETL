@@ -78,3 +78,17 @@ Thumbs.db
 *.swp
 *.swo
 
+
+# Study / presentation material kept outside the repository (copies live in ../)
+CONTEXTO.md
+GUION_SUSTENTACION_FINAL.md
+EXPLICACION_ENTREGA_FINAL.md
+PASOS_EJECUCION.md
+presentacion_final.html
+docs/architecture_pdf_fig1.jpg
+
+# Timestamped GX results (every DAG run writes one); *_latest.json is versioned
+docs/evidence/gx_validation_*_20*.json
+
+# Local tooling
+.ipynb_checkpoints/

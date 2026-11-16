@@ -1,9 +1,22 @@
-"""Apache Kafka Consumer for Domestic Violence Streaming Analytics.
+"""Kafka consumer: contract validation + streaming metrics in PostgreSQL.
 
-Consumes real-time events, validates them against the formal Event Contract,
-handles malformed messages with an explicit Dead-Letter Queue (DLQ), and updates
-at least three streaming metrics in PostgreSQL.
-Complies with Sections 2.6 and 2.7 of the Final Project Rubric.
+For every message of the topic the consumer
+  1. validates it against the Event Contract (``streaming/contract.py``);
+     violations go to the Dead-Letter Queue table ``streaming_invalid_events_log``
+     and the offset is committed, so a "poison pill" never blocks the partition;
+  2. inserts the event into ``streaming_events_log`` (``event_id`` is UNIQUE:
+     a re-delivered event is detected and does NOT change the metrics again);
+  3. updates, in the same DB transaction, the streaming metrics:
+       * Metric 1 - operational volume: events, victims, women and minor victims
+       * Metric 2 - severity: % of events with a lethal weapon and % of minor victims
+       * Metric 3 - institutional pressure: share of the last 50 events that hit
+                    municipalities with a Ley 2126 comisaría deficit
+                    (NORMAL < 25 % <= ALTA < 50 % <= CRITICA)
+       * per-municipality live ranking (``streaming_municipal_metrics``)
+       * end-to-end latency (publication -> persisted) per event;
+  4. commits the Kafka offset only AFTER the DB commit (at-least-once delivery +
+     idempotent sink = effectively-once metrics). If the DB write fails, the
+     consumer rolls back, reconnects and seeks back to the same offset.
 """
 
 import argparse
@@ -13,269 +26,209 @@ import logging
 import os
 import sys
 import time
-from typing import Dict, Any
 
-# Add project root to sys.path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from streaming.contract import ViolenciaIntrafamiliarEvent, EventContractViolationError
+from kafka import KafkaConsumer, TopicPartition  # kafka-python-ng
 
-try:
-    from kafka import KafkaConsumer
-except ImportError:
-    try:
-        from kafka_python_ng import KafkaConsumer
-    except ImportError:
-        KafkaConsumer = None
+from streaming.contract import EventContractViolationError, ViolenciaIntrafamiliarEvent
+from streaming.db import get_db_connection
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [KafkaConsumer] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [KafkaConsumer] %(message)s")
 logger = logging.getLogger("KafkaConsumer")
 
-
-def get_db_connection():
-    """Establishes connection to PostgreSQL streaming database."""
-    host = os.getenv("DB_HOST", "localhost")
-    port = int(os.getenv("DB_PORT", 5432))
-    dbname = os.getenv("DB_NAME", "etl_dw")
-    user = os.getenv("DB_USER", "postgres")
-    password = os.getenv("DB_PASSWORD", "postgres123")
-
-    return psycopg2.connect(
-        host=host,
-        port=port,
-        dbname=dbname,
-        user=user,
-        password=password,
-        connect_timeout=10
-    )
+PRESSURE_WINDOW = 50
 
 
-def log_invalid_event(conn, raw_payload: str, error_reason: str, event_key: str = None):
-    """Persists contract violations to Dead-Letter Queue table for resilience auditing."""
-    try:
-        with conn.cursor() as cur:
+def log_invalid_event(conn, topic, partition, offset, key, raw_payload: str, reason: str):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO streaming_invalid_events_log
+                (event_key, kafka_topic, kafka_partition, kafka_offset, raw_payload, error_reason, received_at)
+            VALUES (%s, %s, %s, %s, %s, %s, now());
+            """,
+            (key or "UNKNOWN", topic, partition, offset, raw_payload, reason),
+        )
+        cur.execute(
+            "UPDATE streaming_metrics_store SET total_eventos_invalidos = total_eventos_invalidos + 1, "
+            "ultima_actualizacion = now() WHERE id = 1;"
+        )
+    conn.commit()
+
+
+def persist_event(conn, ev: ViolenciaIntrafamiliarEvent, partition: int, offset: int) -> bool:
+    """Writes the event and updates all metrics atomically. Returns False for duplicates."""
+    now = datetime.now(timezone.utc)
+    latency_ms = max(0, int((now - ev.timestamp).total_seconds() * 1000))
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO streaming_events_log (
+                event_id, event_key, event_timestamp, origen, id_hecho_origen, fecha_hecho,
+                codigo_dane_municipio, municipio, departamento, genero, grupo_etario, es_menor_de_edad,
+                medio_agresion, es_arma_letal, cantidad_victimas, categoria_municipio,
+                tiene_deficit_ley_2126, kafka_partition, kafka_offset, latencia_ms, processed_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (event_id) DO NOTHING
+            RETURNING id;
+            """,
+            (ev.event_id, ev.event_key, ev.timestamp, ev.origen, ev.id_hecho_origen, ev.fecha_hecho,
+             ev.codigo_dane_municipio, ev.municipio, ev.departamento, ev.genero, ev.grupo_etario,
+             ev.es_menor_de_edad, ev.medio_agresion, ev.es_arma_letal, ev.cantidad_victimas,
+             ev.categoria_municipio, ev.tiene_deficit_ley_2126, partition, offset, latency_ms, now),
+        )
+        if cur.fetchone() is None:
             cur.execute(
-                """
-                INSERT INTO streaming_invalid_events_log (event_key, raw_payload, error_reason, received_at)
-                VALUES (%s, %s, %s, %s);
-                """,
-                (event_key or "UNKNOWN", raw_payload, error_reason, datetime.now(timezone.utc))
+                "UPDATE streaming_metrics_store SET total_duplicados_descartados = total_duplicados_descartados + 1 "
+                "WHERE id = 1;"
             )
-        conn.commit()
-        logger.warning(f"[DLQ RECORDED] Invalid event sent to Dead-Letter Queue: {error_reason[:100]}")
-    except Exception as e:
-        logger.error(f"Failed to record invalid event in DLQ: {e}")
-        conn.rollback()
+            conn.commit()
+            return False
 
-
-def update_streaming_metrics(conn, event: ViolenciaIntrafamiliarEvent):
-    """Atomically updates the 3 streaming metrics in PostgreSQL tables.
-
-    Metric 1: Operational volume in real-time (events, total victims, female & minor victims)
-    Metric 2: Lethality and critical vulnerability rates (lethal weapon %, minor victim %)
-    Metric 3: Institutional deficit saturation alerts (Ley 2126 statutory gap pressure)
-    """
-    try:
-        with conn.cursor() as cur:
-            # 1. Insert into event audit log
-            cur.execute(
-                """
-                INSERT INTO streaming_events_log (
-                    event_id, event_key, event_timestamp, codigo_dane_municipio,
-                    municipio, departamento, genero, grupo_etario, es_menor_de_edad,
-                    medio_agresion, es_arma_letal, cantidad_victimas, categoria_municipio,
-                    tiene_deficit_ley_2126, processed_at
-                ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-                ) ON CONFLICT (event_id) DO NOTHING;
-                """,
-                (
-                    event.event_id, event.event_key, event.timestamp, event.codigo_dane_municipio,
-                    event.municipio, event.departamento, event.genero, event.grupo_etario,
-                    event.es_menor_de_edad, event.medio_agresion, event.es_arma_letal,
-                    event.cantidad_victimas, event.categoria_municipio, event.tiene_deficit_ley_2126,
-                    datetime.now(timezone.utc)
-                )
+        v = ev.cantidad_victimas
+        # Metric 1 + raw counters for metric 2
+        cur.execute(
+            """
+            UPDATE streaming_metrics_store SET
+                total_eventos_procesados  = total_eventos_procesados + 1,
+                total_victimas_procesadas = total_victimas_procesadas + %s,
+                total_victimas_mujeres    = total_victimas_mujeres + %s,
+                total_victimas_menores    = total_victimas_menores + %s,
+                total_casos_arma_letal    = total_casos_arma_letal + %s,
+                total_alertas_deficit_ley2126 = total_alertas_deficit_ley2126 + %s,
+                latencia_promedio_ms = ROUND(((latencia_promedio_ms * total_eventos_procesados) + %s)
+                                             / (total_eventos_procesados + 1), 1),
+                ultimo_evento_id = %s, ultimo_evento_timestamp = %s,
+                ultimo_municipio_reportado = %s, ultimo_departamento_reportado = %s,
+                ultima_actualizacion = now()
+            WHERE id = 1;
+            """,
+            (v, v if ev.genero == "FEMENINO" else 0, v if ev.es_menor_de_edad else 0,
+             1 if ev.es_arma_letal else 0, 1 if ev.tiene_deficit_ley_2126 else 0, latency_ms,
+             ev.event_id, ev.timestamp, ev.municipio, ev.departamento),
+        )
+        # Metric 2 (rates) and Metric 3 (pressure over the last N events)
+        cur.execute(
+            """
+            WITH ventana AS (
+                SELECT tiene_deficit_ley_2126 FROM streaming_events_log ORDER BY id DESC LIMIT %s
+            ), presion AS (
+                SELECT ROUND(100.0 * AVG(CASE WHEN tiene_deficit_ley_2126 THEN 1 ELSE 0 END), 2) AS pct
+                FROM ventana
             )
-
-            # 2. Update singleton KPI metrics store
-            # Compute new values based on existing state
-            cur.execute(
-                """
-                UPDATE streaming_metrics_store
-                SET
-                    total_eventos_procesados = total_eventos_procesados + 1,
-                    total_victimas_procesadas = total_victimas_procesadas + %s,
-                    total_victimas_mujeres = total_victimas_mujeres + CASE WHEN %s = 'FEMENINO' THEN %s ELSE 0 END,
-                    total_victimas_menores = total_victimas_menores + CASE WHEN %s THEN %s ELSE 0 END,
-                    total_casos_arma_letal = total_casos_arma_letal + CASE WHEN %s THEN 1 ELSE 0 END,
-                    total_alertas_deficit_ley2126 = total_alertas_deficit_ley2126 + CASE WHEN %s THEN 1 ELSE 0 END,
-                    tasa_letalidad_pct = ROUND(
-                        ((total_casos_arma_letal + CASE WHEN %s THEN 1 ELSE 0 END)::NUMERIC / (total_eventos_procesados + 1)) * 100, 2
-                    ),
-                    tasa_menores_pct = ROUND(
-                        ((total_victimas_menores + CASE WHEN %s THEN %s ELSE 0 END)::NUMERIC / (total_victimas_procesadas + %s)) * 100, 2
-                    ),
-                    tasa_mujeres_pct = ROUND(
-                        ((total_victimas_mujeres + CASE WHEN %s = 'FEMENINO' THEN %s ELSE 0 END)::NUMERIC / (total_victimas_procesadas + %s)) * 100, 2
-                    ),
-                    indice_presion_operativa = CASE
-                        WHEN (total_alertas_deficit_ley2126 + CASE WHEN %s THEN 1 ELSE 0 END)::NUMERIC / (total_eventos_procesados + 1) >= 0.50 THEN 'CRÍTICA (DÉFICIT SATURADO)'
-                        WHEN (total_alertas_deficit_ley2126 + CASE WHEN %s THEN 1 ELSE 0 END)::NUMERIC / (total_eventos_procesados + 1) >= 0.25 THEN 'ALTA'
-                        ELSE 'MODERADA'
-                    END,
-                    ultimo_evento_id = %s,
-                    ultimo_evento_timestamp = %s,
-                    ultimo_municipio_reportado = %s,
-                    ultimo_departamento_reportado = %s,
-                    ultima_actualizacion = CURRENT_TIMESTAMP
-                WHERE id = 1;
-                """,
-                (
-                    event.cantidad_victimas,
-                    event.genero, event.cantidad_victimas,
-                    event.es_menor_de_edad, event.cantidad_victimas,
-                    event.es_arma_letal,
-                    event.tiene_deficit_ley_2126,
-                    # For rates recalculation:
-                    event.es_arma_letal,
-                    event.es_menor_de_edad, event.cantidad_victimas, event.cantidad_victimas,
-                    event.genero, event.cantidad_victimas, event.cantidad_victimas,
-                    event.tiene_deficit_ley_2126,
-                    event.tiene_deficit_ley_2126,
-                    # Trace:
-                    event.event_id, event.timestamp, event.municipio, event.departamento
-                )
-            )
-
-            # 3. Upsert municipal live ranking
-            cur.execute(
-                """
-                INSERT INTO streaming_municipal_metrics (
-                    codigo_dane_municipio, municipio, departamento, categoria_municipio,
-                    eventos_recientes, victimas_recientes, casos_arma_letal, victimas_menores,
-                    tiene_deficit_ley_2126, ultima_alerta
-                ) VALUES (
-                    %s, %s, %s, %s, 1, %s, CASE WHEN %s THEN 1 ELSE 0 END, CASE WHEN %s THEN %s ELSE 0 END, %s, CURRENT_TIMESTAMP
-                )
-                ON CONFLICT (codigo_dane_municipio) DO UPDATE SET
-                    eventos_recientes = streaming_municipal_metrics.eventos_recientes + 1,
-                    victimas_recientes = streaming_municipal_metrics.victimas_recientes + EXCLUDED.victimas_recientes,
-                    casos_arma_letal = streaming_municipal_metrics.casos_arma_letal + EXCLUDED.casos_arma_letal,
-                    victimas_menores = streaming_municipal_metrics.victimas_menores + EXCLUDED.victimas_menores,
-                    ultima_alerta = CURRENT_TIMESTAMP;
-                """,
-                (
-                    event.codigo_dane_municipio, event.municipio, event.departamento, event.categoria_municipio,
-                    event.cantidad_victimas, event.es_arma_letal, event.es_menor_de_edad, event.cantidad_victimas,
-                    event.tiene_deficit_ley_2126
-                )
-            )
-
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise RuntimeError(f"Database error while updating streaming metrics: {e}") from e
+            UPDATE streaming_metrics_store s SET
+                tasa_letalidad_pct = ROUND(100.0 * total_casos_arma_letal / NULLIF(total_eventos_procesados, 0), 2),
+                tasa_menores_pct   = ROUND(100.0 * total_victimas_menores / NULLIF(total_victimas_procesadas, 0), 2),
+                tasa_mujeres_pct   = ROUND(100.0 * total_victimas_mujeres / NULLIF(total_victimas_procesadas, 0), 2),
+                pct_eventos_deficit_ventana = presion.pct,
+                indice_presion_operativa = CASE
+                    WHEN presion.pct >= 50 THEN 'CRITICA'
+                    WHEN presion.pct >= 25 THEN 'ALTA'
+                    ELSE 'NORMAL' END
+            FROM presion
+            WHERE s.id = 1;
+            """,
+            (PRESSURE_WINDOW,),
+        )
+        # Per-municipality live ranking
+        cur.execute(
+            """
+            INSERT INTO streaming_municipal_metrics (
+                codigo_dane_municipio, municipio, departamento, categoria_municipio, eventos_recientes,
+                victimas_recientes, casos_arma_letal, victimas_menores, tiene_deficit_ley_2126, ultima_alerta)
+            VALUES (%s, %s, %s, %s, 1, %s, %s, %s, %s, now())
+            ON CONFLICT (codigo_dane_municipio) DO UPDATE SET
+                eventos_recientes  = streaming_municipal_metrics.eventos_recientes + 1,
+                victimas_recientes = streaming_municipal_metrics.victimas_recientes + EXCLUDED.victimas_recientes,
+                casos_arma_letal   = streaming_municipal_metrics.casos_arma_letal + EXCLUDED.casos_arma_letal,
+                victimas_menores   = streaming_municipal_metrics.victimas_menores + EXCLUDED.victimas_menores,
+                ultima_alerta      = now();
+            """,
+            (ev.codigo_dane_municipio, ev.municipio, ev.departamento, ev.categoria_municipio, v,
+             1 if ev.es_arma_letal else 0, v if ev.es_menor_de_edad else 0, ev.tiene_deficit_ley_2126),
+        )
+    conn.commit()
+    return True
 
 
-def run_consumer(
-    bootstrap_servers: str,
-    topic: str,
-    group_id: str = "etl_streaming_group",
-    max_messages: int = 0
-):
-    """Initializes consumer, continuously processes events and updates streaming metrics."""
-    logger.info(f"Starting Kafka Consumer for topic '{topic}', group '{group_id}'...")
-
-    if KafkaConsumer is None:
-        raise RuntimeError("Neither 'kafka-python' nor 'kafka-python-ng' is installed.")
-
+def run_consumer(servers, topic, group_id, max_messages=0, idle_timeout_ms=None):
     conn = get_db_connection()
-    logger.info("Connected to PostgreSQL streaming database.")
-
     consumer = KafkaConsumer(
         topic,
-        bootstrap_servers=bootstrap_servers.split(","),
+        bootstrap_servers=servers.split(","),
         group_id=group_id,
         auto_offset_reset="earliest",
         enable_auto_commit=False,
-        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-        consumer_timeout_ms=5000 if max_messages > 0 else -1
+        key_deserializer=lambda k: k.decode("utf-8", errors="replace") if k else None,
+        consumer_timeout_ms=idle_timeout_ms if idle_timeout_ms else float("inf"),
     )
+    logger.info("Subscribed to '%s' as group '%s' (bootstrap %s). Waiting for events...", topic, group_id, servers)
 
-    logger.info(f"Subscribed to topic '{topic}'. Awaiting events...")
-
-    processed_count = 0
-    invalid_count = 0
-
+    processed = invalid = duplicates = 0
     try:
-        for message in consumer:
-            raw_val = message.value
-            event_key = message.key.decode("utf-8") if message.key else None
-
-            # 1. Validate against the Event Contract
+        for msg in consumer:
+            raw = msg.value  # bytes; decoded by the contract so malformed JSON is caught too
             try:
-                event = ViolenciaIntrafamiliarEvent.from_raw_json(raw_val)
+                ev = ViolenciaIntrafamiliarEvent.from_raw_json(raw)
             except EventContractViolationError as err:
-                invalid_count += 1
-                logger.warning(f"[REJECTED] Message offset={message.offset} key={event_key}: {err}")
-                log_invalid_event(conn, json.dumps(raw_val), str(err), event_key)
-                # Commit offset to prevent poison pill loop
+                invalid += 1
+                raw_txt = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+                log_invalid_event(conn, msg.topic, msg.partition, msg.offset, msg.key, raw_txt, str(err))
                 consumer.commit()
-                continue
-            except Exception as unk_err:
-                invalid_count += 1
-                logger.error(f"[PARSE ERROR] Message offset={message.offset}: {unk_err}")
-                log_invalid_event(conn, str(raw_val), f"JSON parse error: {unk_err}", event_key)
-                consumer.commit()
+                logger.warning("[DLQ] partition=%s offset=%s key=%s -> %s", msg.partition, msg.offset, msg.key,
+                               str(err).splitlines()[0][:160])
                 continue
 
-            # 2. Update the 3 streaming metrics in PostgreSQL
-            try:
-                update_streaming_metrics(conn, event)
-                processed_count += 1
-                consumer.commit()
+            while True:  # retry the SAME message until the DB accepts it
+                try:
+                    is_new = persist_event(conn, ev, msg.partition, msg.offset)
+                    break
+                except Exception as db_err:  # noqa: BLE001
+                    logger.error("DB error on %s (offset %s): %s - retrying in 5 s", ev.event_id, msg.offset, db_err)
+                    try:
+                        conn.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    time.sleep(5)
+                    try:
+                        conn.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    conn = get_db_connection()
+            consumer.commit()
 
+            if is_new:
+                processed += 1
                 logger.info(
-                    f"[STREAM EVENT #{processed_count:04d}] Offset={message.offset} | "
-                    f"{event.municipio} ({event.departamento}) | Victimas={event.cantidad_victimas} | "
-                    f"Letal={event.es_arma_letal} | Menor={event.es_menor_de_edad} | Ley2126={event.tiene_deficit_ley_2126}"
+                    "[OK #%04d] p=%s off=%s %s | %s (%s) | victimas=%d%s%s",
+                    processed, msg.partition, msg.offset, ev.event_id, ev.municipio, ev.departamento,
+                    ev.cantidad_victimas, " LETAL" if ev.es_arma_letal else "",
+                    " DEFICIT" if ev.tiene_deficit_ley_2126 else "",
                 )
-            except Exception as e:
-                logger.error(f"Error persisting valid event #{event.event_id}: {e}")
+            else:
+                duplicates += 1
+                logger.info("[DUPLICATE] %s already processed - metrics unchanged", ev.event_id)
 
-            if max_messages > 0 and (processed_count + invalid_count) >= max_messages:
-                logger.info(f"Processed target message count ({max_messages}). Exiting consumer.")
+            if max_messages and (processed + invalid + duplicates) >= max_messages:
                 break
-
     except KeyboardInterrupt:
         logger.info("Consumer stopped by user.")
     finally:
         consumer.close()
         conn.close()
-        logger.info(f"Consumer closed. Processed={processed_count}, Invalid={invalid_count}.")
+        logger.info("Consumer closed. processed=%d invalid=%d duplicates=%d", processed, invalid, duplicates)
+    return processed, invalid, duplicates
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Domestic Violence Streaming Consumer")
-    parser.add_argument("--servers", default=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"), help="Kafka servers")
-    parser.add_argument("--topic", default=os.getenv("KAFKA_TOPIC_VIOLENCIA", "violencia-intrafamiliar-events"), help="Kafka topic")
-    parser.add_argument("--group", default=os.getenv("KAFKA_CONSUMER_GROUP", "etl_streaming_group"), help="Consumer group ID")
-    parser.add_argument("--max-messages", type=int, default=0, help="Stop after N messages (0 for continuous)")
-
-    args = parser.parse_args()
-    run_consumer(
-        bootstrap_servers=args.servers,
-        topic=args.topic,
-        group_id=args.group,
-        max_messages=args.max_messages
-    )
-
+    p = argparse.ArgumentParser(description="Domestic violence streaming consumer")
+    p.add_argument("--servers", default=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092"))
+    p.add_argument("--topic", default=os.getenv("KAFKA_TOPIC_VIOLENCIA", "violencia-intrafamiliar-events"))
+    p.add_argument("--group", default=os.getenv("KAFKA_CONSUMER_GROUP", "etl_streaming_group"))
+    p.add_argument("--max-messages", type=int, default=0, help="Stop after N messages (0 = run forever)")
+    p.add_argument("--idle-timeout-ms", type=int, default=0, help="Stop after N ms without messages (0 = never)")
+    a = p.parse_args()
+    run_consumer(a.servers, a.topic, a.group, a.max_messages, a.idle_timeout_ms or None)

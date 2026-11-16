@@ -2,8 +2,8 @@
   "gate": "validate_api_raw",
   "suite_name": "api_raw_suite",
   "suite_file": "gx/expectations/api_raw_suite.json",
-  "batch_id": null,
-  "timestamp": "2026-11-15T21:22:54.076016",
+  "batch_id": "844b7e238d059bfe426213c425c84da5286dab136c56fbd4f65a54a369f3957e",
+  "timestamp": "2026-11-16T19:11:13.091457",
   "total_records": 1249,
   "rules_evaluated": 5,
   "overall_success": true,
@@ -122,12 +122,23 @@
       "status": "PASSED",
       "result": {
         "element_count": 1249,
-        "missing_count": 17,
-        "missing_percent": 1.3610888710968776,
-        "unexpected_count": 0,
-        "unexpected_percent": 0.0,
-        "unexpected_percent_nonmissing": 0.0,
-        "partial_unexpected_list": []
+        "missing_count": 0,
+        "missing_percent": 0.0,
+        "unexpected_count": 17,
+        "unexpected_percent": 1.3610888710968776,
+        "unexpected_percent_nonmissing": 1.3610888710968776,
+        "partial_unexpected_list": [
+          "nan",
+          "nan",
+          "nan",
+          "nan",
+          "nan",
+          "nan",
+          "nan",
+          "nan",
+          "nan",
+          "nan"
+        ]
       },
       "exception": null
     },
@@ -172,20 +183,9 @@
       "status": "PASSED",
       "result": {
         "element_count": 1249,
-        "unexpected_count": 106,
-        "unexpected_percent": 8.486789431545235,
-        "partial_unexpected_list": [
-          NaN,
-          NaN,
-          NaN,
-          NaN,
-          NaN,
-          NaN,
-          NaN,
-          NaN,
-          NaN,
-          NaN
-        ]
+        "unexpected_count": 0,
+        "unexpected_percent": 0.0,
+        "partial_unexpected_list": []
       },
       "exception": null
     }

@@ -53,8 +53,12 @@ def extract_primary_data(filepath: str = None) -> Tuple[pd.DataFrame, Dict]:
     os.makedirs(RAW_DIR, exist_ok=True)
     target_path = filepath or DEFAULT_CSV_PATH
 
-    if not os.path.exists(target_path):
-        logger.info("Primary raw CSV not found locally. Downloading from %s...", PRIMARY_URL)
+    # The DIJIN file is a periodically re-published snapshot. By default the cached
+    # copy is reused (65 MB); set PRIMARY_FORCE_REFRESH=true to re-download it on
+    # every scheduled run.
+    force_refresh = filepath is None and os.getenv("PRIMARY_FORCE_REFRESH", "false").lower() == "true"
+    if force_refresh or not os.path.exists(target_path):
+        logger.info("Downloading primary raw CSV from %s (force_refresh=%s)...", PRIMARY_URL, force_refresh)
         req = urllib.request.Request(
             PRIMARY_URL,
             headers={"User-Agent": "ETL-Pipeline-DIJIN/2.0"}

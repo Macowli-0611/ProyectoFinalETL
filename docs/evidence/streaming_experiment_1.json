@@ -1,0 +1,37 @@
+{
+  "experiment": "invalid events",
+  "executed_at": "2026-11-16 19:16:19.085943+00:00",
+  "before": {
+    "eventos": 60,
+    "victimas": 271,
+    "invalidos": 0,
+    "duplicados": 0,
+    "dlq_rows": 0
+  },
+  "after": {
+    "eventos": 61,
+    "victimas": 273,
+    "invalidos": 2,
+    "duplicados": 0,
+    "dlq_rows": 2
+  },
+  "dlq_entries": [
+    {
+      "id": 2,
+      "event_key": "00000",
+      "partition": 1,
+      "offset": 16,
+      "error_reason": "Event contract validation failed: Expecting value: line 1 column 1 (char 0)"
+    },
+    {
+      "id": 1,
+      "event_key": "00000",
+      "partition": 1,
+      "offset": 15,
+      "error_reason": "Event contract validation failed: 17 validation errors for ViolenciaIntrafamiliarEvent\nevent_id\n  String should have at least 10 characters [type=string_too_short, input_value='bad-1', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.12/v/string_too_short\ntimestamp\n  I"
+    }
+  ],
+  "consumer_alive": true,
+  "lag_after": 0,
+  "result": "PASS"
+}

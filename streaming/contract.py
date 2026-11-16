@@ -1,164 +1,110 @@
-"""Event Contract for Domestic Violence & Institutional Deficit Streaming Pipeline.
+"""Event Contract (v2) for the domestic-violence streaming pipeline.
 
-Defines the formal schema, required fields, data types, and business constraints
-for every message published to and consumed from Apache Kafka.
-Complies with section 2.6 of the Final Project Rubric.
+Every message published to / consumed from the Kafka topic must satisfy this
+contract. The consumer rejects anything else into the Dead-Letter Queue table
+(``streaming_invalid_events_log``) without stopping.
+
+Contract summary
+----------------
+* Event identifier : ``event_id`` - unique, deterministic for DW replays
+                     (``dw-fact-<id_hecho>``) so re-deliveries are idempotent.
+* Timestamp        : ``timestamp`` - UTC ISO-8601 publication time.
+* Event key        : ``event_key`` - 5-digit DANE municipality code; it is also
+                     the Kafka message key, so all events of one municipality
+                     land in the same partition (per-municipality ordering).
+* Business fields  : ``fecha_hecho`` (date of the incident in the DW),
+                     municipality / department, victim cohort, aggression
+                     mechanism, lethality flag, number of victims and the
+                     Ley 2126 deficit flag of the municipality.
+* Provenance       : ``origen`` - ``DW_REPLAY_SIMULATION`` for historical fact
+                     rows replayed from the Data Warehouse (clearly marked as a
+                     simulation of event arrival) or ``TEST_INJECTION`` for
+                     events produced by the resilience experiments.
 """
 
-from datetime import datetime, timezone
+from datetime import date, datetime
 import json
-from typing import Optional
-from uuid import UUID
+from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+CONTRACT_VERSION = "2.0"
 
 
 class EventContractViolationError(ValueError):
     """Raised when an incoming Kafka message violates the formal event contract."""
-    pass
 
 
 class ViolenciaIntrafamiliarEvent(BaseModel):
-    """Formal Event Contract for real-time domestic violence reports.
+    """Formal Event Contract for domestic-violence report events."""
 
-    Required fields:
-      - event_id: Unique message identifier (UUID v4)
-      - timestamp: ISO-8601 UTC timestamp of occurrence/ingestion
-      - event_key: Partitioning key matching 5-digit DANE code
-      - codigo_dane_municipio: 5-digit municipal DANE identifier (DDMMM)
-      - municipio: Municipality name
-      - departamento: Department name
-      - genero: Victim gender ('FEMENINO', 'MASCULINO', 'NO REPORTA')
-      - grupo_etario: Life stage category ('ADULTOS', 'MENORES', 'ADOLESCENTES', etc.)
-      - es_menor_de_edad: Boolean flag for children/adolescents under statutory age
-      - medio_agresion: Specific aggression mechanism
-      - es_arma_letal: Boolean indicating firearm, bladed weapon, or blunt trauma
-      - cantidad_victimas: Number of registered victims (strictly >= 1)
-      - categoria_municipio: Municipal legal category under Ley 617 ('ESPECIAL', '1', '2', etc.)
-      - tiene_deficit_ley_2126: Boolean indicating statutory Comisaría deficit under Ley 2126
-    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, validate_assignment=True)
 
-    model_config = ConfigDict(
-        extra="forbid",
-        str_strip_whitespace=True,
-        validate_assignment=True
-    )
+    # --- Identity, time and key -------------------------------------------
+    contract_version: Literal["2.0"] = Field(CONTRACT_VERSION, description="Contract version")
+    event_id: str = Field(..., min_length=10, max_length=64, description="Unique event identifier")
+    timestamp: datetime = Field(..., description="UTC publication timestamp (ISO-8601)")
+    event_key: str = Field(..., min_length=5, max_length=5, description="Kafka key = DANE municipality code")
+    origen: Literal["DW_REPLAY_SIMULATION", "TEST_INJECTION"] = Field(..., description="Event provenance")
+    id_hecho_origen: Optional[int] = Field(None, ge=1, description="Source fact row id (DW replays)")
 
-    event_id: str = Field(
-        ...,
-        description="Unique identifier for the event (UUID v4 recommended)",
-        min_length=10,
-        max_length=64
-    )
-    timestamp: datetime = Field(
-        ...,
-        description="Event generation timestamp in UTC (ISO 8601)"
-    )
-    event_key: str = Field(
-        ...,
-        description="Kafka message partition key, strictly matching the 5-digit DANE code",
-        min_length=5,
-        max_length=5
-    )
-    codigo_dane_municipio: str = Field(
-        ...,
-        description="5-digit municipal DANE code (DDMMM)",
-        min_length=5,
-        max_length=5
-    )
-    municipio: str = Field(
-        ...,
-        description="Official name of the municipality",
-        min_length=2,
-        max_length=150
-    )
-    departamento: str = Field(
-        ...,
-        description="Official department name",
-        min_length=2,
-        max_length=100
-    )
-    genero: str = Field(
-        ...,
-        description="Victim gender (FEMENINO, MASCULINO, NO REPORTA)",
-        min_length=3,
-        max_length=50
-    )
-    grupo_etario: str = Field(
-        ...,
-        description="Age cohort classification",
-        min_length=3,
-        max_length=50
-    )
-    es_menor_de_edad: bool = Field(
-        ...,
-        description="Flag indicating if victim is a minor"
-    )
-    medio_agresion: str = Field(
-        ...,
-        description="Harmonized weapon or aggression mechanism",
-        min_length=2,
-        max_length=100
-    )
-    es_arma_letal: bool = Field(
-        ...,
-        description="Flag indicating lethal weapon (firearm / cutting weapon)"
-    )
-    cantidad_victimas: int = Field(
-        ...,
-        description="Number of recorded victims (must be strictly greater than 0)",
-        gt=0
-    )
-    categoria_municipio: str = Field(
-        ...,
-        description="Municipal legal category (Ley 617)",
-        min_length=1,
-        max_length=50
-    )
-    tiene_deficit_ley_2126: bool = Field(
-        ...,
-        description="Statutory Comisaría deficit indicator according to Ley 2126"
-    )
+    # --- Business payload --------------------------------------------------
+    fecha_hecho: date = Field(..., description="Date of the incident as stored in dim_tiempo")
+    codigo_dane_municipio: str = Field(..., min_length=5, max_length=5)
+    municipio: str = Field(..., min_length=2, max_length=150)
+    departamento: str = Field(..., min_length=2, max_length=100)
+    genero: str = Field(..., min_length=3, max_length=50)
+    grupo_etario: str = Field(..., min_length=3, max_length=50)
+    es_menor_de_edad: bool
+    medio_agresion: str = Field(..., min_length=2, max_length=100)
+    es_arma_letal: bool
+    cantidad_victimas: int = Field(..., gt=0, le=1000)
+    categoria_municipio: str = Field(..., min_length=1, max_length=50)
+    tiene_deficit_ley_2126: bool
 
-    @field_validator("codigo_dane_municipio")
+    @field_validator("codigo_dane_municipio", "event_key")
     @classmethod
-    def validate_dane_digits(cls, v: str) -> str:
+    def _dane_5_digits(cls, v: str) -> str:
         if not v.isdigit() or len(v) != 5:
-            raise ValueError(f"DANE code must be exactly 5 numeric digits, got '{v}'")
-        return v
-
-    @field_validator("event_key")
-    @classmethod
-    def validate_event_key(cls, v: str, info) -> str:
-        if not v.isdigit() or len(v) != 5:
-            raise ValueError(f"event_key must be a valid 5-digit DANE code, got '{v}'")
+            raise ValueError(f"must be a 5-digit DANE code, got '{v}'")
         return v
 
     @field_validator("genero")
     @classmethod
-    def validate_genero_standard(cls, v: str) -> str:
-        standard = v.upper()
-        if standard not in {"FEMENINO", "MASCULINO", "NO REPORTA", "OTRO"}:
-            raise ValueError(f"Unexpected gender category '{v}'")
-        return standard
+    def _genero_domain(cls, v: str) -> str:
+        v = v.upper()
+        if v not in {"FEMENINO", "MASCULINO", "NO REPORTA", "NO REPORTADO", "OTRO"}:
+            raise ValueError(f"unexpected gender category '{v}'")
+        return v
+
+    @field_validator("timestamp")
+    @classmethod
+    def _timestamp_tz_aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError("timestamp must include a UTC offset")
+        return v
+
+    @model_validator(mode="after")
+    def _key_matches_municipality(self):
+        if self.event_key != self.codigo_dane_municipio:
+            raise ValueError("event_key must equal codigo_dane_municipio")
+        if self.origen == "DW_REPLAY_SIMULATION" and self.id_hecho_origen is None:
+            raise ValueError("DW replay events must carry id_hecho_origen")
+        return self
 
     def to_kafka_dict(self) -> dict:
-        """Serializes the event into a clean JSON-serializable dictionary."""
-        data = self.model_dump()
-        data["timestamp"] = self.timestamp.isoformat()
-        return data
+        """JSON-serialisable representation used as the Kafka message value."""
+        return self.model_dump(mode="json")
 
     @classmethod
-    def from_raw_json(cls, payload: str | bytes | dict) -> "ViolenciaIntrafamiliarEvent":
-        """Parses and strictly validates raw payload from Kafka."""
+    def from_raw_json(cls, payload) -> "ViolenciaIntrafamiliarEvent":
+        """Parses and strictly validates a raw Kafka payload (bytes, str or dict)."""
         try:
             if isinstance(payload, bytes):
                 payload = payload.decode("utf-8")
-            if isinstance(payload, str):
-                data = json.loads(payload)
-            else:
-                data = payload
+            data = json.loads(payload) if isinstance(payload, str) else payload
+            if not isinstance(data, dict):
+                raise ValueError("payload must be a JSON object")
             return cls(**data)
-        except Exception as e:
-            raise EventContractViolationError(f"Event contract validation failed: {str(e)}") from e
-
+        except Exception as e:  # noqa: BLE001 - every failure is a contract violation
+            raise EventContractViolationError(f"Event contract validation failed: {e}") from e

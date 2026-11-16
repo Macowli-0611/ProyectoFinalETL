@@ -1,0 +1,30 @@
+{
+  "experiment": "consumer interruption",
+  "executed_at": "2026-11-16 19:16:33.220811+00:00",
+  "events_published_while_down": 10,
+  "before": {
+    "eventos": 61,
+    "victimas": 273,
+    "invalidos": 2,
+    "duplicados": 0,
+    "dlq_rows": 2
+  },
+  "while_down": {
+    "eventos": 61,
+    "victimas": 273,
+    "invalidos": 2,
+    "duplicados": 0,
+    "dlq_rows": 2
+  },
+  "lag_while_down": 10,
+  "after_restart": {
+    "eventos": 71,
+    "victimas": 321,
+    "invalidos": 2,
+    "duplicados": 0,
+    "dlq_rows": 2
+  },
+  "lag_after": 0,
+  "recovery_seconds": 3.2,
+  "result": "PASS"
+}
