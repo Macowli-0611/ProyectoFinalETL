@@ -1,561 +1,520 @@
-# Domestic Violence in Colombia — Batch + Streaming Analytical System
-### ETL (G01) · Final Delivery · Airflow + Great Expectations + PostgreSQL DW + Apache Kafka + Power BI + Streamlit
+# Domestic Violence in Colombia
 
-**Faculty:** Faculty of Engineering and Basic Sciences · **Program:** Data Engineering and Artificial Intelligence
-**Institution:** Universidad Autónoma de Occidente (UAO)
-**SDG alignment:** SDG 5 (target 5.2) and SDG 16 (target 16.1)
+## ETL Final Project · Integrated Delivery
 
-**Team:** Michael Macowli Cardona Rodríguez · Sebastián Manrique Mejía · Sebastián Torres Pantoja · David Hernández Paz
+**Universidad Autónoma de Occidente (UAO) · Data Engineering and Artificial Intelligence · ETL (G01)**
 
-> This repository is the **integrated final version** of the project. It extends (does not replace) the
-> repositories of Delivery 1 and Delivery 2.
+**Technologies:** Python, Apache Airflow, Great Expectations, PostgreSQL, Apache Kafka, Power BI, and Streamlit
+**SDG alignment:** SDG 5, target 5.2 · SDG 16, target 16.1
 
----
+> This repository brings together and extends the work from the previous deliveries. The final project is incremental: it preserves the historical violence analysis, adds institutional-capacity data, automates the batch pipeline, and demonstrates streaming. It does not replace or modify the previous repositories.
 
-## Table of contents
-1. [Project overview and objectives](#1-project-overview-and-objectives)
-2. [Data sources and EDA](#2-data-sources-and-eda)
-3. [System architecture](#3-system-architecture)
-4. [Batch ETL pipeline (Airflow)](#4-batch-etl-pipeline-airflow)
-5. [Data quality (Great Expectations)](#5-data-quality-great-expectations)
-6. [Data Warehouse](#6-data-warehouse)
-7. [Batch analytical dashboard (Power BI)](#7-batch-analytical-dashboard-power-bi)
-8. [Streaming pipeline (Kafka)](#8-streaming-pipeline-kafka)
-9. [Real-time dashboard (Streamlit)](#9-real-time-dashboard-streamlit)
-10. [Execution and reproducibility](#10-execution-and-reproducibility)
-11. [Functional evidence](#11-functional-evidence)
-12. [Engineering decisions and limitations](#12-engineering-decisions-and-limitations)
-13. [Objectives achieved](#13-objectives-achieved)
-14. [Repository structure](#14-repository-structure)
+## In simple terms: has the essential work been done?
 
----
+**Yes: the core components required by the rubric are implemented, and the repository contains evidence of actual executions.** The system extracts two data sources, profiles, cleans and integrates them, validates data quality, loads a dimensional model, addresses historical requirements R1–R7, and demonstrates a Kafka flow with an event contract, metrics, and an updating dashboard.
 
-## 1. Project overview and objectives
-
-### 1.1 Problem
-Police reports of domestic violence in Colombia grew from **23,171 victims in 2010 to 138,803 in 2025**
-(Policía Nacional – DIJIN). Reported volume alone does not say *where the State lacks capacity to respond*.
-Ley 2126 de 2021 requires municipalities to have Comisarías de Familia in proportion to their population, so we
-integrate the DIJIN reports with the national directory of Comisarías de Familia (MinJusticia, SODA API) to relate
-violence to institutional capacity.
-
-**Why this pipeline?** To give public-policy analysts (batch) and a monitoring room (low latency) a single,
-validated source of truth that combines *how much violence there is* with *how much capacity exists to attend it*.
-
-### 1.2 Refined objectives
-
-| # | Objective | Type |
-|---|---|---|
-| O1 | Automate, with Airflow, the periodic extraction of both sources, their cleaning/integration and the load of a star-schema DW. | Batch |
-| O2 | Block with Great Expectations any batch that violates critical quality rules before it reaches the DW, and make the failure visible in Airflow. | Batch |
-| O3 | Answer the historical analytical requirements **R1–R7** in a BI dashboard connected to the DW. | Batch |
-| O4 | Publish new DW facts as Kafka events, validate them with an event contract and maintain **3 streaming metrics** with low latency. | Streaming |
-| O5 | Show those metrics in a dashboard that changes visibly as events arrive, and prove the behaviour with invalid events and a consumer outage. | Streaming |
-
-Historical requirements (batch): **R1** yearly evolution · **R2** territorial concentration · **R3** gender and age
-vulnerability · **R4** aggression mechanism and lethality · **R5** lethal attacks on minors by municipality ·
-**R6** overload of existing comisarías (victims per comisaría) · **R7** Ley 2126 deficit and intervention priority.
-
-### 1.3 Batch vs. low-latency requirements
-
-| | Batch analytical layer | Low-latency streaming layer |
-|---|---|---|
-| Question | *What happened, where and to whom (2010–2026)?* | *What is arriving right now and is it hitting municipalities without enough comisarías?* |
-| Users | Policy analysts, ministries | Monitoring / dispatch room |
-| Latency | Daily (`@daily` DAG, ~1 min run) | Seconds (event → PostgreSQL in ~10–30 ms; dashboard refresh 3 s) |
-| Data | Full DIJIN history + API snapshot | New fact rows replayed as events (simulation, see §8.2) |
-| Quality control | 3 Great Expectations gates | Pydantic event contract + Dead-Letter Queue + idempotent sink |
-| Output | Power BI (R1–R7) | Streamlit live dashboard |
-
-**Value of the streaming component.** The DW holds ~150 fact rows and ~380 victims **per day** with strong peaks
-(EDA §S1). With a daily batch, a surge of incidents in municipalities that already lack comisarías (e.g. Cúcuta,
-1 installed vs. 9 required) is only visible the next day. The streaming layer updates the volume, severity and
-institutional-pressure metrics within seconds of each report, which is what an operational room needs to reallocate
-staff or escalate cases.
-
----
-
-## 2. Data sources and EDA
-
-### 2.1 Sources
-
-| | Static dataset | Dynamic API |
-|---|---|---|
-| Provider | Policía Nacional – DIJIN | Ministerio de Justicia y del Derecho |
-| Dataset | *Reporte Delito Violencia Intrafamiliar* (`vuyt-mqpw`) | *Caracterización de las Comisarías de Familia* (`7tuu-upb2`) |
-| Access | CSV download from datos.gov.co, SHA-256 manifest (`data/raw/primary_source_manifest.json`) | SODA REST API, paginated (`$limit=2000`, `$offset`, `$order=:id`), retries with back-off, cache fallback |
-| Size | 704,551 rows · 8 columns · 1,501,809 victims · 2010-01-01 → 2026-07-31 | 1,249 records · 15 columns · 1,102 municipalities |
-| Refresh | Re-published periodically; re-downloaded when `PRIMARY_FORCE_REFRESH=true` | Queried live on every DAG run |
-
-**Streaming events.** There is no public real-time feed of police reports, so events are generated by replaying
-the DW fact table chronologically (one event per new fact row). This is explicitly a **simulation** of event
-arrival — every event carries `origen = "DW_REPLAY_SIMULATION"` and the original incident date (`fecha_hecho`).
-They require lower latency because they represent incidents an operational room must react to the same day (§1.3).
-
-### 2.2 EDA
-
-Notebook: [`notebooks/01_eda_and_profiling.ipynb`](notebooks/01_eda_and_profiling.ipynb) (executed, with outputs).
-It profiles **both raw sources**, the cross-source join and the loaded DW.
-
-| | |
+| Built component | What it means in simple terms |
 |---|---|
-| ![Victims per year](docs/img/eda_victimas_por_anio.png) | ![Raw aggression mechanism](docs/img/eda_armas_medios.png) |
-| ![Gender x age](docs/img/eda_demografia.png) | ![API categories](docs/img/eda_api_categorias.png) |
+| Airflow batch ETL | The process of collecting, preparing, and saving data is organized and automated. |
+| Three data-quality gates | Data is checked before it reaches the warehouse; a critical failure stops the load. |
+| Data Warehouse and Power BI dashboard | Clean data is stored for historical analysis and to answer R1–R7. |
+| Kafka, event contract, and DLQ | Events are checked; invalid ones are recorded instead of crashing the consumer. |
+| Three streaming metrics and Streamlit dashboard | The demonstration flow shows what is arriving and how its indicators change. |
+| Evidence | Reports, screenshots, and saved results cover loads, controlled failures, and resilience experiments. |
 
-![Victims per day 2025](docs/img/eda_victimas_diarias_2025.png)
+**The main items to review before presenting are not missing deliverables.** They are limitations and assumptions that should be explained or improved: DIJIN data may remain cached, streaming is an explicitly documented simulation, R6 compares a historical total with current capacity, and some missing API values are filled with `1`. See [Decisions, limitations, and recommended improvements](#decisions).
 
-### 2.3 How EDA findings drove cleaning, transformation and quality rules
+## Contents
 
-| # | Finding (raw data) | Decision implemented (`src/transform_and_integrate.py`, `src/dimensional_model.py`) | GX rule |
-|---|---|---|---|
-| P1 | `CANTIDAD` is an aggregated count, always ≥ 1, median 1, max 198 | Two measures: `cantidad_victimas` and `numero_registros`; declared fact grain | DQ-RAW1-04 (critical), DQ-PREP-05 (critical) |
-| P2 | Dates `dd/mm/yyyy`; 2026 only Jan–Jul | Strict parsing; `dim_tiempo.es_periodo_completo` flags partial periods | DQ-RAW1-02 (critical) |
-| P3 | 8-digit DANE code; 6 rows with invalid `00000`/`52000`; `(CT)` capital marker in 39 % of rows | Roll-up to 5-digit `DDMMM`; remap invalid codes; derive `es_capital`; modal name per code | DQ-RAW1-03 (critical) |
-| P4 | Bladed weapons under 4 labels; 10.3 % of victims with `NO REPORTADO` mechanism | Harmonised `medio_agresion`, `categoria_mecanismo`, `es_arma_letal` (bladed + firearm); `NO REPORTADO` kept explicit | DQ-PREP-03 (critical FK) |
-| P5 | 3,379 null genders, 1,406 null age groups | Explicit `NO REPORTADO` cohort (no victim dropped); `es_menor_de_edad` | DQ-RAW1-05 (warning) |
-| A1 | 194 API codes lost the leading zero (`5088`) | `zfill(5)` before joining | DQ-RAW2-02 (critical) |
-| A2 | API at comisaría grain, literal `'Null'` strings, 24 rows with 0 comisarías | `dim_comisaria` outrigger; municipal roll-up with installed / required / gap | DQ-RAW2-01, DQ-RAW2-04 (critical) |
-| I1 | After padding, 1,100 of 1,111 DIJIN municipalities match the API (99.85 % of victims) | Full outer join + explicit defaults for non-municipalised areas | DQ-PREP-06 (warning) |
-| S1 | ~150 fact rows / ~380 victims per day with peaks | Streaming replay + 3 live metrics | Event contract v2 + DLQ |
+1. [🎯 Project, objectives, and previous deliveries](#project)
+2. [📚 Data sources and EDA](#sources)
+3. [🏗️ Architecture](#architecture)
+4. [⚙️ Batch ETL with Airflow](#batch)
+5. [✅ Data quality with Great Expectations](#quality)
+6. [🗄️ Data Warehouse](#warehouse)
+7. [📊 Historical analysis R1–R7](#historical)
+8. [📨 Streaming with Kafka](#streaming)
+9. [📈 Real-time dashboard](#realtime)
+10. [▶️ Setup and execution](#execution)
+11. [🧾 Functional evidence](#evidence)
+12. [🧭 Decisions, limitations, and recommended improvements](#decisions)
+13. [🗂️ Repository structure](#structure)
 
----
+<a id="project"></a>
+## 1. 🎯 Project, objectives, and previous deliveries
 
-## 3. System architecture
+### The problem this project addresses
 
-![Architecture](docs/img/architecture.png)
+National Police reports show how many domestic-violence victims were reported. On their own, they do not explain how much institutional capacity is available to respond. This project therefore combines reports from the National Police (DIJIN) with the Ministry of Justice directory of Family Police Stations (*Comisarías de Familia*).
 
-Source of the diagram: [`docs/img/architecture.png`](docs/img/architecture.png) (Mermaid source also available in [`docs/architecture/architecture.mmd`](docs/architecture/architecture.mmd)).
-It follows the recommended architecture of the assignment: two sources → Airflow (extract → GX → transform → GX →
-load) → PostgreSQL DW → Power BI; DW → Kafka producer → topic → consumer → streaming tables → real-time dashboard.
-All components run with Docker Compose (`postgres_dw`, `kafka`, `kafka_init`, `airflow`, `stream_consumer`,
-`realtime_dashboard`, on-demand `stream_producer`).
+In simple terms: **one source counts reported incidents; the other describes part of the institutional capacity.** Linking them by the municipality's DANE code makes it possible to explore reported violence alongside the distribution of stations and the gap against the requirement in Law 2126.
 
----
+### How this project builds on earlier deliveries
 
-## 4. Batch ETL pipeline (Airflow)
+- It preserves the DIJIN historical source and requirements **R1–R5** developed earlier.
+- It integrates the Ministry of Justice source and adds the institutional analyses **R6 and R7**.
+- The final delivery brings those elements together with Airflow, Great Expectations, the Data Warehouse, and a Kafka/Streamlit demonstration.
+- The assignment describes the final delivery as incremental. The event flow is explicitly labeled as a simulation; it is not presented as a connection to live police reports.
 
-DAG [`dags/etl_violencia_intrafamiliar_dag.py`](dags/etl_violencia_intrafamiliar_dag.py) —
-`dag_id = etl_violencia_intrafamiliar_final`, Airflow **3.1.8** TaskFlow API, `schedule="@daily"`, `catchup=False`,
-`max_active_runs=1`.
+### Objectives
 
-![DAG graph](docs/img/airflow_dag_graph.png)
+1. Automate source extraction, transformation, integration, and Data Warehouse loading.
+2. Validate data before loading and stop the pipeline when critical rules fail.
+3. Answer historical requirements R1–R7 using the Data Warehouse and batch dashboard.
+4. Demonstrate event publication and validation, and calculate at least three streaming metrics.
+5. Show the metrics in a dashboard that updates as events are processed.
 
-| Order | Task | What it does | Retries |
-|---|---|---|---|
-| 1a | `extract_primary` | Loads/downloads the DIJIN CSV (all columns as text to keep leading zeros), SHA-256, manifest | 2 × 1 min (I/O) |
-| 1b | `extract_api` | Paginates the SODA API, persists `data/raw/api_comisarias_raw.json`, manifest | 3 × 2 min (HTTP 429/timeouts) |
-| 2a | `validate_primary_raw` | **GX gate 1** on the raw CSV | 0 (deterministic) |
-| 2b | `validate_api_raw` | **GX gate 2** on the raw API batch | 0 |
-| 3 | `transform_and_clean_and_integrate` | Cleaning (§2.3), integration on the 5-digit DANE key, star-schema build, Parquet in `data/processed/` | 0 |
-| 4 | `validate_prepared` | **GX gate 3**: grain uniqueness, FK integrity, exact reconciliation of victims and records | 0 |
-| 5 | `load_dimensional_dw` | Single transaction: DDL (`sql/01_create_dw.sql`) → `COPY` of 5 dims + fact → BI views (`sql/03_bi_views.sql`) → post-load reconciliation (`docs/evidence/reconciliation_report.json`) | 2 × 1 min (DB) |
+| Objective | Layer |
+|---|---|
+| O1. Periodically extract both sources, integrate them, and load a dimensional warehouse. | Batch |
+| O2. Stop batches that violate critical quality rules and make the failure visible in Airflow. | Batch |
+| O3. Answer historical analytical requirements R1–R7 with the Data Warehouse and a BI dashboard. | Batch |
+| O4. Publish Data Warehouse facts as Kafka events, validate their contract, and maintain three metrics. | Streaming |
+| O5. Show metrics changing as events arrive and demonstrate invalid-event and consumer-outage behavior. | Streaming |
 
-Only small manifests (paths, counts, hashes) travel through XCom; data is exchanged as files.
-A `test_mode` parameter (UI → *Trigger* → params) runs the three reliability scenarios:
-`TEST_A_SUCCESSFUL_RUN`, `TEST_B_CONTROLLED_FAILURE` (drops a mandatory API column before gate 2) and
-`TEST_C_SAFE_RERUN` (idempotent reload).
+| | Historical batch layer | Low-latency demonstration layer |
+|---|---|---|
+| Question | What happened, where, and to whom over the historical period? | What is arriving through the event flow, and is it associated with municipalities with a capacity deficit? |
+| Main users | Policy and analytical teams | Monitoring and dispatch teams |
+| Update | Daily batch schedule; the source itself may be cached (see [limitations](#decisions)). | Producer publishes at a configurable interval; Streamlit refreshes every 3 seconds by default. |
+| Data | DIJIN history joined with a MinJusticia snapshot. | Historical Data Warehouse facts replayed as clearly labeled simulated events. |
+| Quality controls | Great Expectations gates before loading. | Pydantic event contract, DLQ, and idempotent database sink. |
+| Output | Power BI dashboard for R1–R7. | Streamlit dashboard for the three streaming metrics. |
 
----
+**Why include streaming?** A daily batch cannot show a new event immediately. The replay makes it possible to demonstrate how volume, severity, and institutional-pressure indicators can change shortly after event processing. It is a reproducible demonstration of that architecture, not a live operational alert service.
 
-## 5. Data quality (Great Expectations)
+The full academic instructions are in the [final-delivery rubric PDF](docs/ETL_2026-2_ETLProject_FinalDelivery.pdf).
 
-Suites in [`gx/expectations/`](gx/expectations), checkpoints and validation definitions in [`gx/`](gx),
-runner in [`src/validate_gx.py`](src/validate_gx.py) (GX 1.x, ephemeral context). Each gate writes its result to
-`docs/evidence/gx_validation_<gate>_latest.json`.
+<a id="sources"></a>
+## 2. 📚 Data sources and EDA
 
-| Gate | Rule | Expectation | Severity |
-|---|---|---|---|
-| 1 · primary raw | DQ-RAW1-01 | the 8 mandatory columns exist | Critical |
-| | DQ-RAW1-02 | `FECHA HECHO` matches `dd/mm/yyyy` | Critical |
-| | DQ-RAW1-03 | `CODIGO DANE` has exactly 8 digits | Critical |
-| | DQ-RAW1-04 | `CANTIDAD` numeric, not null, ≥ 1 | Critical |
-| | DQ-RAW1-05 | `GENERO` not null (mostly 0.99) | Warning |
-| 2 · API raw | DQ-RAW2-01 | DANE code, category, `existencia_de_comisarias`, Ley 2126 target exist | Critical |
-| | DQ-RAW2-02 | municipality code length 4–5 | Critical |
-| | DQ-RAW2-03 | category in {ESP, 1–6} (mostly 0.98) | Warning |
-| | DQ-RAW2-04 | installed comisarías ≥ 0 | Critical |
-| | DQ-RAW2-05 | `existencia_de_comisarias` not null (mostly 0.9) | Warning |
-| 3 · prepared | DQ-PREP-01 | fact grain `(tiempo, geografía, víctima, medio)` unique | Critical |
-| | DQ-PREP-02/03 | FKs not null and present in each dimension | Critical |
-| | DQ-PREP-04 | `comisarias_instaladas` ≥ 0 | Critical |
-| | DQ-PREP-05 | Σ victims = 1,501,809 and Σ records = 704,551 (exact reconciliation with the source) | Critical |
-| | DQ-PREP-06 | non-municipalised areas ≤ 2 % | Warning |
+### Data sources
 
-**Latest results (Airflow run of 2026-11-16):** gate 1 → 6/6 rules passed, gate 2 → 5/5, gate 3 → 13/13.
+| Source | What it contributes | Access and observed size |
+|---|---|---|
+| National Police – DIJIN, *Reporte Delito Violencia Intrafamiliar* (`vuyt-mqpw`) | Reports, date, municipality, gender, age group, aggression mechanism, and victim count. | [datos.gov.co CSV](https://www.datos.gov.co/api/views/vuyt-mqpw/rows.csv?accessType=DOWNLOAD); 704,551 rows, 8 columns, and 1,501,809 victims. The profiled batch covers 2010-01-01 through 2026-07-31. |
+| Ministry of Justice, *Caracterización de las Comisarías de Familia* (`7tuu-upb2`) | Family stations, municipality code, category, and figures associated with Law 2126. | [datos.gov.co SODA REST API](https://www.datos.gov.co/resource/7tuu-upb2.json); 1,249 records, 15 columns, and 1,102 distinct municipal codes. Results are paginated. |
 
-**Behaviour on a critical failure.** The gate raises `AirflowFailException` (no retries); the task turns red and
-every downstream task becomes `upstream_failed`, so **nothing is written to the DW** (the load also runs inside a
-single transaction that is rolled back on any error). Warnings are logged and recorded in the evidence JSON but do
-not stop the run. See the real Test B run in §11.2.
+The original inputs are stored in `data/raw/` when extracted, but are not committed to Git; `.gitignore` excludes them. The extraction manifests record file size, columns, hash, and extraction time.
 
----
+### What profiling found
 
-## 6. Data Warehouse
+- `CANTIDAD` is an aggregated measure, so the model preserves both victim counts and the number of source reports.
+- The primary source uses `dd/mm/yyyy` dates; 2026 is a partial period in the profiled batch.
+- Some API DANE codes have lost their leading zero; they are normalized to five digits before joining.
+- Gender, age-group, and API fields contain missing or unreported values. They are retained or imputed according to the transformation and quality rules described below.
+- Profiling recorded 1,100 matches between 1,112 municipalities in the primary source and API codes (98.92% by municipality count). Unmatched areas remain in the model; their victims are not discarded.
 
-DDL: [`sql/01_create_dw.sql`](sql/01_create_dw.sql) · BI views: [`sql/03_bi_views.sql`](sql/03_bi_views.sql) ·
-streaming store: [`sql/02_create_streaming_store.sql`](sql/02_create_streaming_store.sql). PostgreSQL 16.
+### EDA and how it informed cleaning
 
-![Star Schema - Domestic Violence Data Warehouse](docs/img/star_schema.png)
+The executed [01_eda_and_profiling.ipynb notebook](notebooks/01_eda_and_profiling.ipynb) analyzes both raw sources, their integration, and the Data Warehouse. Saved visualizations are in `docs/img/`.
 
-* **Grain:** one row per *day × municipality × victim cohort (gender, age group) × aggression mechanism*
-  (`UNIQUE uq_fact_grano`). 704,551 source records collapse to 701,714 fact rows with **all victims preserved**.
-* **Dimensions:** `dim_tiempo` (dense calendar), `dim_geografia` (municipality + Ley 617 category + Ley 2126 installed /
-  required / gap), `dim_victima`, `dim_medio`, `dim_comisaria` (outrigger directory of 1,247 comisarías).
-* **Loading strategy:** full, idempotent reload in one transaction (drop/create → `COPY` → views → reconciliation).
-  Re-running the DAG produces the same counts and zero duplicates (Test C). The source is a full snapshot, so a full
-  reload is simpler and safer than incremental merges at this volume (~1 min).
+| Finding | Implemented decision |
+|---|---|
+| Missing gender and age-group values | Keep them in explicit `NO REPORTADO` cohorts; do not drop victims. |
+| DANE codes with differing lengths and several malformed codes | Normalize the municipal key and document the applied corrections. |
+| Multiple labels for bladed weapons | Harmonize labels and derive mechanism categories and a lethal-weapon flag. |
+| Multiple Family Police Stations within a municipality | Preserve the directory and roll up institutional capacity to municipality level. |
+| Municipalities present in only one source | Use an outer integration, retain records, and expose the matching coverage. |
 
-Loaded tables (real query output, [`docs/evidence/dw_load_check.txt`](docs/evidence/dw_load_check.txt)):
+### EDA-to-implementation traceability
 
-```text
-            tabla             | filas  | victimas | registros
-------------------------------+--------+----------+-----------
- fact_violencia_intrafamiliar | 701714 |  1501809 |    704551
- dim_tiempo                   |   6056 |          |
- dim_geografia                |   1113 |          |
- dim_victima                  |     11 |          |
- dim_medio                    |      6 |          |
- dim_comisaria                |   1247 |          |
- huerfanos_geo = 0 | duplicados_grano = 0
+| EDA finding | Implementation decision | Related quality check |
+|---|---|---|
+| `CANTIDAD` is an aggregated count; observed values are positive and reach 198. | Keep `cantidad_victimas` and `numero_registros` as separate measures; declare the fact grain before aggregation. | DQ-RAW1-04, DQ-PREP-05 |
+| Dates use `dd/mm/yyyy`; the latest profiled year is partial. | Parse dates strictly and flag incomplete periods in `dim_tiempo`. | DQ-RAW1-02 |
+| DIJIN publishes eight-digit DANE codes; several malformed prefixes require explicit handling. | Roll up to the five-digit municipality code and document known corrections. | DQ-RAW1-03 |
+| Weapon descriptions use multiple labels; some mechanisms are not reported. | Harmonize mechanism labels, derive categories and lethality, and retain `NO REPORTADO`. | Prepared-data referential and reconciliation checks |
+| Gender and age group contain missing values. | Preserve those reports in an explicit `NO REPORTADO` cohort instead of dropping victims. | DQ-RAW1-05 (warning) |
+| The API includes four-digit municipal codes that lost a leading zero. | Apply `zfill(5)` before joining sources. | DQ-RAW2-02 |
+| API data is at Family Police Station grain and includes missing or string-valued fields. | Keep a station directory and roll it up to municipality-level capacity; review the explicit imputation assumptions in [Limitations](#decisions). | DQ-RAW2-01, DQ-RAW2-04, DQ-RAW2-05 |
+| Not every primary-source municipality has an API match. | Use an outer join and explicit unmatched-area values so primary-source victims remain in the model. | DQ-PREP-06 (warning) |
+
+**EDA figures**
+
+| Historical trend | Daily pattern (2025) | Victims per report |
+|---|---|---|
+| ![Victims by year](docs/img/eda_victimas_por_anio.png) | ![Victims per day in 2025](docs/img/eda_victimas_diarias_2025.png) | ![Victims per report distribution](docs/img/eda_cantidad_hist.png) |
+
+| Aggression mechanisms | Demographic profile | Institutional categories |
+|---|---|---|
+| ![Aggression mechanisms and weapons](docs/img/eda_armas_medios.png) | ![Gender and age](docs/img/eda_demografia.png) | ![Family Police Station municipality categories](docs/img/eda_api_categorias.png) |
+
+<a id="architecture"></a>
+## 3. 🏗️ Architecture
+
+![Integrated project architecture](docs/img/architecture.png)
+
+The system has two parts:
+
+1. **Batch:** DIJIN and API → extraction and validation → transformation and integration → PostgreSQL Data Warehouse → Power BI.
+2. **Streaming demonstration:** Data Warehouse facts → Kafka producer → topic → consumer and event validation → PostgreSQL streaming tables → Streamlit dashboard.
+
+The diagram source is [architecture.mmd](docs/architecture/architecture.mmd). Local services are defined in [docker-compose.yaml](docker-compose.yaml).
+
+<a id="batch"></a>
+## 4. ⚙️ Batch ETL with Airflow
+
+The DAG in [etl_violencia_intrafamiliar_dag.py](dags/etl_violencia_intrafamiliar_dag.py) is named `etl_violencia_intrafamiliar_final`. It is scheduled with `@daily`, does not catch up on missed runs, and allows only one active run at a time.
+
+| Step | Task | In simple terms |
+|---|---|---|
+| 1 | `extract_primary` | Downloads or reuses the DIJIN CSV, calculates SHA-256, and writes a manifest. |
+| 2 | `extract_api` | Requests API pages, saves the response, and writes a manifest. |
+| 3 | `validate_primary_raw` and `validate_api_raw` | Check each source before the sources are combined. |
+| 4 | `transform_and_clean_and_integrate` | Cleans and normalizes DANE codes, integrates the sources, and writes prepared Parquet tables. |
+| 5 | `validate_prepared` | Checks the grain, keys, coverage, and measure reconciliation before touching the warehouse. |
+| 6 | `load_dimensional_dw` | Reloads the dimensional model in one transaction and compares the result with the source. |
+
+The Airflow graph shows the two extraction and validation branches converging before transformation, prepared-data validation, and loading:
+
+![Airflow DAG graph with the batch task flow](docs/img/airflow_dag_graph.png)
+
+Tasks exchange small references through XCom; larger datasets are stored as files and are not passed through XCom. Network and database tasks have retries; deterministic validation and transformation tasks fail without retries.
+
+The runtime uses Airflow 3.1.8 and PostgreSQL 16. The deployment is intended for a local demonstration; Docker service names and ports are listed in [Setup and execution](#execution).
+
+| Task type | Retry policy | Reason |
+|---|---:|---|
+| Primary source extraction | 2 retries, 1-minute delay | May recover from transient file or network I/O issues. |
+| API extraction | 3 retries, 2-minute delay | May recover from API rate limits, timeouts, or temporary availability issues. |
+| Raw/prepared validation and transformation | No retries | Repeating unchanged data and deterministic rules does not fix a data or logic failure. |
+| Data Warehouse load | 2 retries, 1-minute delay | May recover from transient database connectivity or lock issues. |
+
+The DAG has three test modes: `TEST_A_SUCCESSFUL_RUN`, `TEST_B_CONTROLLED_FAILURE`, and `TEST_C_SAFE_RERUN`. **Test B removes a mandatory API column and fails at Gate 2.**
+
+> **Caution when rerunning:** the batch load is designed as a full, idempotent reload. Its DDL drops and recreates the Data Warehouse tables inside the transaction. This is not an incremental load that preserves prior warehouse snapshots.
+
+<a id="quality"></a>
+## 5. ✅ Data quality with Great Expectations
+
+Declarative rules are in `gx/expectations/`; the runner is [validate_gx.py](src/validate_gx.py). Each gate saves evidence to `docs/evidence/gx_validation_*_latest.json`.
+
+| Gate | Examples of what it checks | What happens if a critical rule fails |
+|---|---|---|
+| 1. Raw DIJIN | Required columns, date format, DANE code, and positive numeric victim count. | Airflow marks the task as failed and does not run dependent tasks. |
+| 2. Raw API | Required fields, municipal-code length, category domain, and Family Police Station values. | Integration and Data Warehouse loading are blocked. |
+| 3. Prepared data | Grain uniqueness, foreign keys, relationships to dimensions, and victim/report reconciliation. | Loading is blocked before writing to PostgreSQL. |
+
+The declarative suite rules use stable IDs so their intent can be traced in evidence:
+
+| Rule IDs | Meaning |
+|---|---|
+| DQ-RAW1-01–05 | DIJIN schema, date format, DANE code, positive numeric measure, and gender completeness warning. |
+| DQ-RAW2-01–05 | API schema, municipality code, category-domain warning, non-negative installed count, and completeness warning. |
+| DQ-PREP-01–06 | Fact-grain uniqueness, non-null and valid foreign keys, non-negative installed capacity, exact measure reconciliation, and municipal matching coverage warning. |
+
+Warnings are recorded but do not stop the pipeline. This policy distinguishes errors that prevent building the analysis from observations that should remain visible. The evidence from November 16, 2026 records all three gates as passing: 6 results for the primary source, 5 for the API, and 13 for prepared data.
+
+<a id="warehouse"></a>
+## 6. 🗄️ Data Warehouse
+
+The schema is defined in [01_create_dw.sql](sql/01_create_dw.sql); analytical views are in [03_bi_views.sql](sql/03_bi_views.sql). PostgreSQL stores one fact table and five dimensions:
+
+![Star schema for the domestic-violence Data Warehouse](docs/img/star_schema.png)
+
+- `fact_violencia_intrafamiliar`: victim and source-report measures.
+- `dim_tiempo`: calendar and complete-period flag.
+- `dim_geografia`: municipality, category, and Family Police Station measures.
+- `dim_victima`: gender and age group.
+- `dim_medio`: aggression mechanism.
+- `dim_comisaria`: Family Police Station directory.
+
+**Fact grain:** one row per day × municipality × demographic cohort × aggression mechanism. Multiple source reports are aggregated into that combination without losing the number of victims or reports.
+
+The fact table's natural grain is enforced with a unique constraint on `(id_tiempo, id_geografia, id_victima, id_medio)`. Dimensions use integer surrogate keys; the geographic dimension also carries the municipality code used for source integration and by the Kafka event key.
+
+| Table | Reported rows |
+|---|---:|
+| `fact_violencia_intrafamiliar` | 701,714 |
+| `dim_tiempo` | 6,056 |
+| `dim_geografia` | 1,113 |
+| `dim_victima` | 11 |
+| `dim_medio` | 6 |
+| `dim_comisaria` | 1,247 |
+
+The load evidence records 1,501,809 victims, 704,551 source reports, zero orphan keys, and zero duplicate grain combinations ([reconciliation report](docs/evidence/reconciliation_report.json), [verification query output](docs/evidence/dw_load_check.txt)).
+
+> **Important:** a batch run rebuilds the Data Warehouse tables. The transaction prevents a partial load, but a successful run replaces the previous warehouse contents.
+
+<a id="historical"></a>
+## 7. 📊 Historical analysis R1–R7
+
+The Power BI file is [dashboard_historico_violencia.pbix](dashboard/batch/dashboard_historico_violencia.pbix). It connects to PostgreSQL at `localhost:5432`, database `etl_dw`, and uses the Data Warehouse and BI views in *Import* mode, so refresh it after a batch load.
+
+| Req. | Question answered | Documented result |
+|---|---|---|
+| **R1** | How does reported violence change over time? | From 23,171 victims in 2010 to 138,803 in 2025; 2026 is partial. Growth in 2020 was 1.93%; interpret it with possible under-reporting during that period in mind. |
+| **R2** | Where are reports concentrated? | 63.99% of victims are reported in departmental capitals. |
+| **R3** | What gender and age profiles appear in the data? | 77.33% of victims are women; 93,986 are children or adolescents. |
+| **R4** | Which mechanisms are reported, and which are flagged as lethal? | 51.06% no weapons, 34.31% blunt objects, 10.25% not reported, 3.67% bladed weapons, and 0.22% firearms in the documented cut. |
+| **R5** | Which municipalities have reported lethal attacks against minors? | Bogotá (362), Cartagena (221), and Cali (198) are among the highest values shown. |
+| **R6** | How many reported victims correspond to each installed Family Police Station? | Cúcuta (20,389), Popayán (17,070), and Bello (16,984), each with one station in the documented cut. **These are cumulative victims compared with currently reported capacity, not an annual rate.** |
+| **R7** | Where is there a gap against the Law 2126 requirement? | The dashboard documents a gap of 106 stations in 59 municipalities; Cúcuta has a gap of 8 and Soacha a gap of 6 in the analyzed cut. |
+
+Screenshots for the seven visuals are in `dashboard/batch/` (`r1_...png` through `r7_...png`). Views for overload and intervention priority are defined in `sql/03_bi_views.sql`.
+
+| R1 · Yearly evolution | R2 · Territorial distribution | R3 · Gender and age |
+|---|---|---|
+| ![R1 yearly evolution](dashboard/batch/r1_evolucion_anual.png) | ![R2 territorial distribution](dashboard/batch/r2_departamentos.png) | ![R3 gender and age](dashboard/batch/r3_genero.png) |
+
+| R4 · Aggression mechanisms | R5 · Minor victims | R6 · Station workload |
+|---|---|---|
+| ![R4 mechanisms](dashboard/batch/r4_mecanismos.png) | ![R5 minor-victim map](dashboard/batch/r5_mapa_menores.png) | ![R6 station workload](dashboard/batch/r6_sobrecarga.png) |
+
+| R7 · Intervention priority |
+|---|
+| ![R7 intervention priority](dashboard/batch/r7_prioridad.png) |
+
+<a id="streaming"></a>
+## 8. 📨 Streaming with Kafka
+
+The project is not connected to a public live feed of police reports. To provide a reproducible streaming demonstration, [producer.py](streaming/producer.py) **replays real Data Warehouse facts as demonstration events**, identified by `origen = "DW_REPLAY_SIMULATION"`. The rubric allows simulated events when their source, frequency, and rationale are documented; they must not be presented as live alerts.
+
+### Topic and delivery settings
+
+| Setting | Value |
+|---|---|
+| Topic | `violencia-intrafamiliar-events` |
+| Broker | Kafka 3.7 in KRaft mode, one local broker |
+| Partitions | 3 |
+| Event key | Five-digit DANE code; preserves ordering per municipality |
+| Retention | 24 hours |
+| Delivery | Producer uses `acks=all`; consumer manually commits offsets and writes idempotently to PostgreSQL |
+
+The producer reads facts from the Data Warehouse starting at 2026-01-01 by default, publishes one event per fact row, and saves a *watermark* so later runs can continue. Its default rate is **one event per second**, configurable with `--interval` (for example, `--interval 0.5` for a demo). This demonstrates how indicators could change shortly after a report arrives rather than waiting for the next daily batch. A deterministic `event_id` (`dw-fact-<id_hecho>`) helps discard duplicate deliveries. `--reset` explicitly resets the producer checkpoint.
+
+The topic has three partitions and a replication factor of one because this is a single-broker local demonstration. The consumer group is `etl_streaming_group`; automatic offset commits are disabled. The Kafka key is the municipality's DANE code, so events for that municipality are routed to the same partition.
+
+### Event contract and consumer
+
+The Pydantic v2 contract is in [contract.py](streaming/contract.py). It uses contract version `2.0` and rejects additional fields. It checks the following:
+
+| Field | Contract rule |
+|---|---|
+| `event_id` | String of 10–64 characters; deterministic for Data Warehouse replay events. |
+| `timestamp` | Datetime with a timezone offset; the producer emits UTC. |
+| `event_key`, `codigo_dane_municipio` | Exactly five digits and equal to each other. |
+| `origen`, `id_hecho_origen` | Source is identified; Data Warehouse replay events must include their source fact ID. |
+| Municipality, department, demographic group, and mechanism | Required, non-empty strings with length limits where applicable. |
+| `es_menor_de_edad`, `es_arma_letal`, `tiene_deficit_ley_2126` | Required boolean values. |
+| `cantidad_victimas` | Integer greater than zero and at most 1,000 per event. |
+
+The documented contract check reports zero violations across 91,754 fact rows from 2025–2026.
+
+The [consumer](streaming/consumer.py) validates each message:
+
+1. Invalid events are recorded in `streaming_invalid_events_log`, the Dead-Letter Queue (DLQ), together with the reason and partition/offset.
+2. Valid events are recorded in `streaming_events_log`.
+3. Metrics are updated in the same database transaction. If the same `event_id` arrives again, its metrics are not counted twice.
+4. The Kafka offset is committed after the PostgreSQL write.
+5. If PostgreSQL fails, the transaction is rolled back and the consumer retries the same message instead of intentionally skipping it.
+
+### Streaming metrics
+
+| Metric | What it shows |
+|---|---|
+| **M1. Operational volume** | Events and victims processed, including women and minor victims. |
+| **M2. Severity** | Percentage of events with a lethal weapon and percentage of victims who are minors, calculated from processed event/victim counts. |
+| **M3. Institutional pressure** | Percentage of the last 50 events in municipalities with a Family Police Station deficit; `NORMAL` is below 25%, `ALTA` is 25% to below 50%, and `CRITICA` is 50% or above. |
+
+The pipeline also records per-municipality metrics, latency, invalid events, and duplicates. Supporting tables are defined in [02_create_streaming_store.sql](sql/02_create_streaming_store.sql).
+
+<a id="realtime"></a>
+## 9. 📈 Real-time dashboard
+
+The [app_realtime.py](dashboard/app_realtime.py) application uses Streamlit and Plotly to query PostgreSQL. The consumer updates PostgreSQL, and the dashboard queries the tables every three seconds by default (configurable from one to ten seconds). In the demonstration, a new event appears after processing and by the next dashboard refresh at the latest.
+
+The dashboard includes the three metrics, recent events, top municipalities, cohort and mechanism breakdowns, latency, and the DLQ. Unlike Power BI, which presents historical data, Streamlit displays what has passed through Kafka since the streaming store was created.
+
+| Before publishing events | After events have been processed |
+|---|---|
+| ![Real-time dashboard before publishing events](docs/img/rt_dashboard_before.png) | ![Real-time dashboard after processing events](docs/img/rt_dashboard_after.png) |
+
+For a full-page view of the dashboard and its detailed panels, see the [full dashboard screenshot](docs/img/rt_dashboard_full.png).
+
+<a id="execution"></a>
+## 10. ▶️ Setup and execution
+
+### Requirements
+
+- Docker Desktop with Docker Compose v2 and enough memory to run Airflow, PostgreSQL, and Kafka.
+- Internet access to download DIJIN data and query the API, unless a local cache is used.
+- Python 3.11 or later to run the producer, experiments, or notebook from Windows.
+- Power BI Desktop to open and refresh the `.pbix` file.
+
+### Configure and start the services
+
+From the repository root in PowerShell:
+
+```powershell
+Copy-Item .env.example .env
 ```
 
----
+Edit `.env` and replace `DB_PASSWORD` with a local password. Do not share or commit this file. `API_APP_TOKEN` is optional.
 
-## 7. Batch analytical dashboard (Power BI)
-
-File: [`dashboard/batch/dashboard_historico_violencia.pbix`](dashboard/batch/dashboard_historico_violencia.pbix).
-It connects with the **PostgreSQL connector** (Get Data → PostgreSQL → `localhost:5432`, database `etl_dw`, import
-mode) to `fact_violencia_intrafamiliar`, the four dimensions and the views `vw_r6_sobrecarga_comisarias` and
-`vw_r7_prioridad_intervencion`. After a DAG run, *Refresh* pulls the new DW state.
-
-| Req. | Visual | Main insight (DW values) |
-|---|---|---|
-| R1 | Yearly line | 23,171 victims (2010) → 138,803 (2025), ×6; 2020 grew only +1.93 % (lockdown under-reporting); 2026 is partial. |
-| R2 | Departments / capitals | **63.99 %** of victims are reported in department capitals. |
-| R3 | Gender and age | **77.33 %** of victims are women (1,161,392); **93,986** are children or adolescents. |
-| R4 | Mechanism funnel | 51.06 % without weapons, 34.31 % blunt objects, 10.25 % not reported, 3.67 % bladed, 0.22 % firearms. |
-| R5 | Map of minors attacked with lethal weapons | Highest counts: Bogotá (362), Cartagena (221), Cali (198). |
-| R6 | Victims per installed comisaría | Cúcuta 20,389, Popayán 17,070, Bello 16,984 victims per single comisaría; 59 municipalities in critical overload. |
-| R7 | Ley 2126 gap and priority | **106** missing comisarías in **59** municipalities; largest gaps Cúcuta (8), Soacha (6), Bello / Soledad / Montería (5). |
-
-| | | |
-|---|---|---|
-| ![R1](dashboard/batch/r1_evolucion_anual.png) | ![R2](dashboard/batch/r2_departamentos.png) | ![R3](dashboard/batch/r3_genero.png) |
-| ![R4](dashboard/batch/r4_mecanismos.png) | ![R5](dashboard/batch/r5_mapa_menores.png) | ![R6](dashboard/batch/r6_sobrecarga.png) |
-| ![R7](dashboard/batch/r7_prioridad.png) | | |
-
----
-
-## 8. Streaming pipeline (Kafka)
-
-### 8.1 Topic configuration
-Apache Kafka 3.7 in KRaft mode (no ZooKeeper). The `kafka_init` service creates the topic explicitly
-(automatic topic creation is disabled):
-
-| Setting | Value | Reason |
-|---|---|---|
-| Topic | `violencia-intrafamiliar-events` | one business stream |
-| Partitions | 3 | parallelism; ordering per municipality is enough |
-| Key | 5-digit DANE municipality code | all events of a municipality go to the same partition (ordered) |
-| Replication | 1 | single local broker (see limitations) |
-| Retention | 24 h (`retention.ms=86400000`) | enough to replay a consumer outage |
-| Producer | `acks=all`, `retries=5`, synchronous send per event | no silent loss |
-| Consumer group | `etl_streaming_group`, `auto_offset_reset=earliest`, manual commit | at-least-once |
-
-### 8.2 Event generation — producer ([`streaming/producer.py`](streaming/producer.py))
-* Reads `fact_violencia_intrafamiliar` joined with its dimensions **in chronological order** (`fecha`; within a day
-  a deterministic pseudo-random order so municipalities interleave) and publishes **one event per fact row**.
-  Default start: 2026-01-01 (the most recent period in the DW).
-* **No repeated publications:** a watermark (`fecha`, order, `id_hecho`) is stored in
-  `streaming_producer_checkpoint` after each delivered event; the next run continues after it. `--reset` restarts
-  explicitly. `event_id = dw-fact-<id_hecho>` is deterministic, so even a forced replay is de-duplicated downstream.
-* **Rate:** `--interval` seconds between events (default 1 s; 0.2–0.5 s in the demos).
-* It is a **simulation of arrival** of historical records (`origen = DW_REPLAY_SIMULATION`).
-
-### 8.3 Event contract v2 ([`streaming/contract.py`](streaming/contract.py), Pydantic v2, `extra="forbid"`)
-
-| Field | Type | Rule |
-|---|---|---|
-| `contract_version` | `"2.0"` | literal |
-| `event_id` | str 10–64 | **event identifier**, unique |
-| `timestamp` | datetime with offset | **event timestamp** (UTC publication time) |
-| `event_key` | str(5) digits | **event key** = Kafka key = `codigo_dane_municipio` |
-| `origen` | `DW_REPLAY_SIMULATION` \| `TEST_INJECTION` | provenance; DW replays must carry `id_hecho_origen` |
-| `id_hecho_origen` | int ≥ 1, optional | source fact row |
-| `fecha_hecho` | date | incident date in the DW |
-| `codigo_dane_municipio`, `municipio`, `departamento` | str | 5 digits / 2–150 / 2–100 chars |
-| `genero` | str | FEMENINO, MASCULINO, NO REPORTA, NO REPORTADO, OTRO |
-| `grupo_etario`, `medio_agresion`, `categoria_municipio` | str | non-empty |
-| `es_menor_de_edad`, `es_arma_letal`, `tiene_deficit_ley_2126` | bool | required |
-| `cantidad_victimas` | int | 1 ≤ x ≤ 1000 |
-
-All 91,754 fact rows of 2025–2026 were checked against the contract with 0 violations.
-
-### 8.4 Consumer ([`streaming/consumer.py`](streaming/consumer.py))
-1. Deserialises and validates each message. Invalid JSON or contract violations go to the **Dead-Letter Queue**
-   table `streaming_invalid_events_log` (raw payload, reason, partition, offset) and the offset is committed, so a
-   poison pill never blocks the partition.
-2. Inserts the event into `streaming_events_log` (`event_id UNIQUE`). If it already exists the message is counted as
-   a duplicate and **metrics are not touched** (idempotent sink).
-3. Updates the metrics **in the same DB transaction**, then commits the Kafka offset (at-least-once delivery +
-   idempotent sink ⇒ metrics counted once). If PostgreSQL fails, it rolls back, reconnects and retries the same
-   message instead of skipping it.
-
-### 8.5 Streaming metrics (table `streaming_metrics_store`)
-
-| Metric | Definition | Why it matters in real time |
-|---|---|---|
-| **M1 · Operational volume** | events processed, victims, women victims, minor victims | workload arriving at the monitoring room |
-| **M2 · Severity** | % of events with a lethal weapon (bladed/firearm); % of victims who are minors | cases that need immediate escalation |
-| **M3 · Institutional pressure** | % of the **last 50 events** located in municipalities with a Ley 2126 deficit → `NORMAL` < 25 % ≤ `ALTA` < 50 % ≤ `CRITICA` | detects bursts landing where capacity is already insufficient |
-| Support | per-municipality live ranking, publication→DB latency, DLQ count, duplicates discarded | pipeline health |
-
----
-
-## 9. Real-time dashboard (Streamlit)
-
-[`dashboard/app_realtime.py`](dashboard/app_realtime.py) — service `realtime_dashboard`, http://127.0.0.1:8501.
-
-* **Consumer → dashboard integration:** the consumer commits every event and metric update to PostgreSQL; the page
-  is a Streamlit *fragment* with `run_every = N s` (slider 1–10 s, default **3 s**) that re-queries the streaming
-  tables. A new event is visible at most *N* seconds after the consumer commits it.
-* **Content:** the 3 metrics (+ women %, latency, DLQ, duplicates), events per 10-second window, live top
-  municipalities coloured by Ley 2126 deficit, cohort and mechanism breakdown, the last 15 events (with partition and
-  latency) and the last DLQ entries.
-* **Difference with the historical dashboard:** Power BI answers R1–R7 over 2010–2026 from the DW and is refreshed
-  after a batch run; Streamlit only shows what arrived through Kafka and changes with every event.
-
-| Before publishing (0 events) | After publishing 60 events |
-|---|---|
-| ![before](docs/img/rt_dashboard_before.png) | ![after](docs/img/rt_dashboard_after.png) |
-
-Full page after the resilience experiments (feed, cohorts, mechanisms and DLQ):
-[`docs/img/rt_dashboard_full.png`](docs/img/rt_dashboard_full.png).
-
-**Insights observed in the demo** (60 events of 1 Jan 2026): Bogotá concentrates most victims in the window;
-~20 % of the last 50 events fall in municipalities with a comisaría deficit (pressure `NORMAL`); lethal weapons
-appear in ~4–5 % of events; the mean publication→database latency is a few milliseconds when the consumer is up.
-
----
-
-## 10. Execution and reproducibility
-
-### 10.1 Requirements
-* Docker Desktop (Compose v2), 8 GB RAM available for Docker.
-* For the host-side scripts (producer, experiments, notebook): Python 3.11+ and `pip install -r requirements.txt`.
-* Internet access on the first DAG run (datos.gov.co).
-
-### 10.2 Configuration
-```bash
-cp .env.example .env      # then set DB_PASSWORD (any local value)
-```
-`.env` is git-ignored. Inside Docker the services use `postgres_dw:5432` and `kafka:29092`; from the host use
-`localhost:5432` and `127.0.0.1:9092` (already the defaults in `.env.example`).
-
-### 10.3 Start the stack
-```bash
+```powershell
 docker compose build
 docker compose up -d
-docker compose ps        # postgres_dw/kafka healthy, kafka_init exited 0, airflow, stream_consumer, realtime_dashboard up
+docker compose ps
 ```
-PostgreSQL runs `sql/01_create_dw.sql`, `02_create_streaming_store.sql` and `03_bi_views.sql` on first start.
 
-| Service | URL |
+Local services:
+
+| Service | Address |
 |---|---|
-| Airflow UI | http://127.0.0.1:8080 (local demo mode: no login, see §12) |
-| Real-time dashboard | http://127.0.0.1:8501 |
+| Airflow | http://127.0.0.1:8080 |
+| Streamlit | http://127.0.0.1:8501 |
 | PostgreSQL | `localhost:5432`, database `etl_dw` |
+| Kafka from Windows | `127.0.0.1:9092` |
 
-### 10.4 Run and verify the batch pipeline
-1. The DAG `etl_violencia_intrafamiliar_final` is unpaused and scheduled `@daily`; it also runs once when the stack
-   starts. To run it manually: Airflow UI → *Trigger*, or
-   ```bash
-   docker exec etl_final_airflow airflow dags trigger etl_violencia_intrafamiliar_final
-   ```
-2. Controlled quality failure (Test B) and safe rerun (Test C):
-   ```bash
-   docker exec etl_final_airflow airflow dags trigger etl_violencia_intrafamiliar_final --conf '{"test_mode":"TEST_B_CONTROLLED_FAILURE"}'
-   docker exec etl_final_airflow airflow dags trigger etl_violencia_intrafamiliar_final --conf '{"test_mode":"TEST_C_SAFE_RERUN"}'
-   ```
-3. Verify the DW:
-   ```bash
-   docker exec etl_final_postgres_dw psql -U postgres -d etl_dw -c "SELECT count(*), sum(cantidad_victimas) FROM fact_violencia_intrafamiliar;"
-   ```
-   Expected: `701714 | 1501809`. GX results: `docs/evidence/gx_validation_*_latest.json`.
-4. Power BI: open the `.pbix`, point the PostgreSQL source to your server if needed and click *Refresh*.
+Airflow uses simplified authentication for the local demo. Do not expose these ports to the Internet.
 
-### 10.5 Run and verify streaming
-```bash
-# the consumer is already running as a service; watch it
-docker logs -f etl_final_stream_consumer
+### Run the batch pipeline
 
-# publish 50 new DW facts, one every 0.5 s (from the host)
-python streaming/producer.py --count 50 --interval 0.5
-#   or fully inside Docker:
-docker compose run --rm stream_producer --count 50 --interval 0.5
+The DAG is scheduled daily. It can also be triggered manually:
 
-# include malformed messages (every 10th) to see the DLQ
+```powershell
+docker exec etl_final_airflow airflow dags trigger etl_violencia_intrafamiliar_final
+```
+
+DAG test modes:
+
+```powershell
+docker exec etl_final_airflow airflow dags trigger etl_violencia_intrafamiliar_final --conf '{"test_mode":"TEST_B_CONTROLLED_FAILURE"}'
+docker exec etl_final_airflow airflow dags trigger etl_violencia_intrafamiliar_final --conf '{"test_mode":"TEST_C_SAFE_RERUN"}'
+```
+
+Test B is expected to fail during API validation. Test C runs the full load again and compares totals before and after. To verify the documented result:
+
+```powershell
+docker exec etl_final_postgres_dw psql -U postgres -d etl_dw -c "SELECT count(*), sum(cantidad_victimas) FROM fact_violencia_intrafamiliar;"
+```
+
+Expected for the documented batch: `701714 | 1501809`.
+
+### Run the streaming demonstration
+
+The consumer starts with Compose. To publish events from Windows:
+
+```powershell
+python -m pip install -r requirements.txt
+python streaming/producer.py --count 30 --interval 0.5
+```
+
+Alternatively, run the producer inside Docker:
+
+```powershell
+docker compose run --rm stream_producer --count 30 --interval 0.5
+```
+
+To inject invalid events and inspect the DLQ:
+
+```powershell
 python streaming/producer.py --count 30 --interval 0.5 --inject-invalid
 ```
-Open http://127.0.0.1:8501 while the producer runs: the metrics, charts and feed change every 3 s.
 
-Resilience experiments (§11.4), with assertions and JSON evidence:
-```bash
+Run resilience experiments while the services are available:
+
+```powershell
 python streaming/test_resilience.py --events 10
 ```
 
-### 10.6 EDA notebook
-```bash
-jupyter notebook notebooks/01_eda_and_profiling.ipynb   # needs the raw files created by the DAG and DB access via .env
-```
+The consumer-interruption experiment stops and restarts the `etl_final_stream_consumer` container. Run it only when that is appropriate for your demonstration.
 
-### 10.7 Reset
-```bash
-docker compose down        # keep data
-docker compose down -v     # also delete the PostgreSQL volume
-```
+### Source refresh and persistence
 
----
+- The API is queried on each normal extraction run. If the query fails, the extractor can use an existing local cache; the manifest records whether that fallback was used.
+- The DIJIN CSV is reused by default if it already exists. To attempt a fresh download on each run, change `PRIMARY_FORCE_REFRESH=false` to `PRIMARY_FORCE_REFRESH=true` in `.env`, then recreate the Airflow service so it receives the updated environment (for example, `docker compose up -d --force-recreate airflow`).
+- Power BI uses Import mode. Open the file and select **Refresh** after a batch load.
 
-## 11. Functional evidence
+> **Do not remove data by accident:** `docker compose down` stops the services and preserves the volume. `docker compose down -v` also deletes the PostgreSQL volume, including the Data Warehouse and streaming metrics/events. Use it only if you intend to lose that local data. A batch load also replaces the Data Warehouse tables by design.
 
-All evidence below comes from real executions on 2026-11-16 (screenshots of the running system, JSON written by
-the code, console logs).
+<a id="evidence"></a>
+## 11. 🧾 Functional evidence
 
-### 11.1 Successful Airflow execution
-DAG overview with three runs (scheduled success, Test B failed on purpose, Test C success):
-![DAG grid](docs/img/airflow_dag_grid.png)
+The versioned evidence comes from executions documented on November 15 and 16, 2026:
 
-Successful run — all 7 tasks green (≈ 57 s):
-![success run](docs/img/airflow_run_success_tasks.png)
+- **Airflow:** DAG and successful/failed run screenshots in `docs/img/airflow_*.png`.
+- **Controlled failure:** [test_b_controlled_failure.json](docs/evidence/test_b_controlled_failure.json) and screenshots showing downstream tasks blocked.
+- **Load and reconciliation:** [reconciliation_report.json](docs/evidence/reconciliation_report.json) and [dw_load_check.txt](docs/evidence/dw_load_check.txt).
+- **Validation:** [primary gate](docs/evidence/gx_validation_primary_raw_latest.json), [API gate](docs/evidence/gx_validation_api_raw_latest.json), and [prepared-data gate](docs/evidence/gx_validation_prepared_latest.json).
+- **Batch runs A and C:** [successful run](docs/evidence/test_a_successful_run.json) and [idempotent rerun](docs/evidence/test_c_safe_rerun.json).
+- **Invalid events and DLQ:** [Experiment 1](docs/evidence/streaming_experiment_1.json).
+- **Consumer interruption and recovery:** [Experiment 2](docs/evidence/streaming_experiment_2.json).
+- **Duplicate delivery:** [Experiment 3](docs/evidence/streaming_experiment_3.json).
+- **Dashboard:** before/after screenshots in `docs/img/rt_dashboard_*.png`.
 
-### 11.2 Data quality failure visible in Airflow (Test B)
-`validate_api_raw` fails with critical rules DQ-RAW2-01 and DQ-RAW2-04; `transform`, `validate_prepared` and
-`load_dimensional_dw` are `upstream_failed`, so the DW is not touched:
-![failed run](docs/img/airflow_run_failed_tasks.png)
-![gate 2 log](docs/img/airflow_gate2_failure_log.png)
+These are saved results, not a guarantee that containers are currently running. Start the application to repeat the demonstration.
 
-### 11.3 Data Warehouse loading
-Reconciliation written by `load_dimensional_dw`: [`docs/evidence/reconciliation_report.json`](docs/evidence/reconciliation_report.json);
-table counts and integrity checks: [`docs/evidence/dw_load_check.txt`](docs/evidence/dw_load_check.txt) (§6).
-GX results of the same run: [`gx_validation_primary_raw_latest.json`](docs/evidence/gx_validation_primary_raw_latest.json),
-[`gx_validation_api_raw_latest.json`](docs/evidence/gx_validation_api_raw_latest.json),
-[`gx_validation_prepared_latest.json`](docs/evidence/gx_validation_prepared_latest.json).
+### Airflow execution screenshots
 
-### 11.4 Kafka producer / consumer and resilience experiments
-Script: [`streaming/test_resilience.py`](streaming/test_resilience.py) · full console log:
-[`docs/evidence/streaming_experiments_console.log`](docs/evidence/streaming_experiments_console.log) ·
-consumer log excerpt: [`docs/evidence/consumer_log_excerpt.txt`](docs/evidence/consumer_log_excerpt.txt).
-
-**Experiment 1 — invalid events** ([json](docs/evidence/streaming_experiment_1.json)). A contract-violating JSON and a
-non-JSON message are published, followed by a valid DW event.
-```text
->>> Before: {'eventos': 60, 'victimas': 271, 'invalidos': 0, 'duplicados': 0, 'dlq_rows': 0}
-    DLQ #2 p=1 off=16: Event contract validation failed: Expecting value: line 1 column 1 (char 0)
-    DLQ #1 p=1 off=15: Event contract validation failed: 17 validation errors for ViolenciaIntrafamiliarEvent
->>> After: {'eventos': 61, 'victimas': 273, 'invalidos': 2, 'duplicados': 0, 'dlq_rows': 2} | consumer alive=True
->>> RESULT: PASS
-```
-*Observed:* both bad messages are stored in the DLQ with partition/offset and reason, their offsets are committed,
-the consumer keeps running and processes the valid event right after them.
-
-**Experiment 2 — consumer interruption** ([json](docs/evidence/streaming_experiment_2.json)). The consumer container
-is really stopped (`docker stop`), 10 events are published, then it is restarted.
-```text
->>> Step 0 - baseline: {'eventos': 61, ...}, lag=0
-    docker stop etl_final_stream_consumer -> running=False
->>> Step 2 - publishing 10 DW events while the consumer is down
->>> Step 3 - while down: metrics={'eventos': 61, ...} | consumer-group lag=10
-    docker start etl_final_stream_consumer -> running=True
->>> Step 5 - after restart (3.2s): metrics={'eventos': 71, 'victimas': 321, ...} | lag=0
->>> RESULT: PASS
-```
-*Observed:* while the consumer is down the metrics freeze and Kafka retains the 10 events (lag = 10). On restart the
-group resumes from its last committed offset and processes exactly the 10 events in 3.2 s — no loss, no duplicates.
-*Limitations:* the dashboard shows stale values during the outage; the latency metric includes the downtime of
-those events (the mean jumps from a few ms to ~1.3 s); events older than the 24 h retention would be lost.
-
-**Experiment 3 — duplicate delivery** ([json](docs/evidence/streaming_experiment_3.json)). An already processed event
-is re-published with the same `event_id` → counted as duplicate, metrics unchanged (idempotent sink).
-
-**Streaming metrics updated in the dashboard:** screenshots in §9 (0 → 60 events) and the full page after the
-experiments (2 DLQ rows, 1 duplicate):
-![dashboard full](docs/img/rt_dashboard_full.png)
-
-### 11.5 Earlier runner evidence
-`src/run_pipeline.py` reproduces tests A/B/C outside Airflow (useful for CI); its outputs are kept in
-`docs/evidence/test_a_successful_run.json`, `test_b_controlled_failure.json`, `test_c_safe_rerun.json`.
-
----
-
-## 12. Engineering decisions and limitations
-
-**Decisions**
-1. **Full idempotent reload** of the DW in one transaction: the source is a full snapshot; it guarantees no duplicates
-   and an all-or-nothing load (Test C).
-2. **Selective retries:** only I/O tasks retry; quality gates and transformations fail fast because they are deterministic.
-3. **Exact reconciliation as a critical rule:** the DW must contain exactly the victims and records of the source.
-4. **Streaming from the DW, not synthetic data:** events are real fact rows, replayed with a persistent watermark so
-   nothing is published twice.
-5. **At-least-once + idempotent sink:** manual offset commit after the DB commit and `event_id UNIQUE` give
-   effectively-once metrics without Kafka transactions.
-6. **DLQ in PostgreSQL** (not a second topic): invalid messages are auditable from the same dashboard.
-7. **Kafka key = DANE code:** per-municipality ordering, natural partitioning.
-8. **KRaft single broker:** lightweight local deployment.
-9. **Polling dashboard (3 s):** simple and compatible with Streamlit; latency bounded by the refresh interval.
-
-**Assumptions:** the API municipal code is the integration key; a municipality's Ley 2126 requirement is the
-`comisarias_ley_2126_100_000` field of the API; fact rows of the same day are emitted in a pseudo-random order
-because the source has no time of day.
-
-**Known limitations**
-* Streaming is a **simulation** (replay of historical facts); there is no live police feed.
-* One broker with replication factor 1: no fault tolerance of Kafka itself.
-* Streaming metrics are cumulative since the streaming store was created (except M3, which uses a 50-event window);
-  re-running `sql/02_create_streaming_store.sql` resets them.
-* A full DW reload regenerates `id_hecho`; the producer watermark is date-based, so it keeps working, but the
-  `event_id` of an already published day may change after a reload.
-* Power BI Desktop runs on Windows only; the `.pbix` uses import mode and must be refreshed after each batch run.
-
-**Reliability and security**
-* No credentials in the repository: `.env` is git-ignored and Compose fails fast if `DB_PASSWORD` is missing; no
-  default passwords in code.
-* All ports are bound to `127.0.0.1`. Airflow uses `SIMPLE_AUTH_MANAGER_ALL_ADMINS=true` **only for local demos**
-  (no password stored anywhere); for any shared deployment configure real users and remove that variable.
-* Streamlit usage statistics are disabled; Kafka uses PLAINTEXT on the local network (TLS/SASL would be required in
-  production).
-
----
-
-## 13. Objectives achieved
-
-| Objective | Evidence |
+| Successful end-to-end run | Controlled failure and blocked downstream tasks |
 |---|---|
-| O1 Automated batch ETL | DAG `@daily`, successful runs (§11.1), DW loaded and reconciled (§6, §11.3) |
-| O2 Quality gates visible in Airflow | 3 GX suites, 24 rules; Test B blocks the load and shows the failure (§11.2) |
-| O3 Historical requirements R1–R7 | Power BI connected to the DW with R1–R7 visuals and insights (§7) |
-| O4 Streaming with contract and 3 metrics | Producer from the DW, contract v2, DLQ, idempotent consumer, M1–M3 (§8) |
-| O5 Observable real-time dashboard and resilience | Dashboard 0 → 60 events, experiments 1–3 PASS (§9, §11.4) |
+| ![Airflow successful task run](docs/img/airflow_run_success_tasks.png) | ![Airflow controlled-failure task run](docs/img/airflow_run_failed_tasks.png) |
 
----
+The [Gate 2 task log](docs/img/airflow_gate2_failure_log.png) shows the injected missing API field and the resulting validation failure. The [Airflow DAG grid](docs/img/airflow_dag_grid.png) provides another view of task states across runs.
 
-## 14. Repository structure
+### Recorded test outcomes
+
+| Test | Recorded outcome |
+|---|---|
+| Test A — successful batch | Passed end to end; 704,551 source records and 1,501,809 victims reconciled exactly, with zero orphan keys. |
+| Test B — controlled quality failure | Passed the blocking test: Gate 2 rejected the missing API field, and all three downstream tasks were blocked. |
+| Test C — safe rerun | Passed; a second load produced zero changes in fact rows, victims, source records, or dimension counts. |
+| Streaming Experiment 1 — invalid events | Passed; two invalid messages were written to the DLQ and the consumer remained alive. |
+| Streaming Experiment 2 — consumer interruption | Passed; ten queued events were processed after restart and Kafka lag returned to zero in 3.2 seconds. |
+| Streaming Experiment 3 — duplicate delivery | Passed; the duplicate count increased by one while event and victim totals remained unchanged. |
+
+<a id="decisions"></a>
+## 12. 🧭 Decisions, limitations, and recommended improvements
+
+### Prototype limitations
+
+1. **Simulated streaming:** events come from the Data Warehouse, not a live police-reporting service. This is an intentional, documented limitation; the rubric allows simulated event arrival if its strategy and low-latency rationale are explained.
+2. **Kafka capacity:** the project uses one broker and replication factor 1. That is sufficient for a local demonstration, not for fault tolerance in production.
+3. **R6 is cumulative:** the view compares victims across the full historical series with the current number of Family Police Stations. Do not interpret it as annual workload or historical capacity by year.
+4. **Missing institutional data:** some capacity values are filled with `1`. This can affect the legal gap and should be examined before presenting R6/R7 as exact measurements.
+5. **DIJIN refresh:** `PRIMARY_FORCE_REFRESH` defaults to `false`. A daily DAG may process the same local file again; “daily” does not necessarily mean “new data every day.”
+6. **Manifest date range:** profiling records data through 2026-07-31, but the primary manifest may report 31/12/2025 because the extractor compares date strings as text. Parse the dates before using this field as the official range.
+7. **Power BI:** the file is a desktop report in Import mode and requires a manual refresh after a load. Power BI Desktop is needed for the interactive report.
+8. **Data and refreshes:** input CSV/JSON files are not versioned. Runs depend on datos.gov.co being available or on a local cache.
+
+### Security and data handling
+
+- Do not commit passwords, tokens, or `.env` files. `.env` is excluded by `.gitignore`; Compose requires `DB_PASSWORD`.
+- Airflow, PostgreSQL, Kafka, and Streamlit ports are bound to `127.0.0.1` for the local demonstration.
+- Airflow uses simplified demo authentication and Kafka uses PLAINTEXT. Do not expose this setup to a public or shared network.
+- Before deploying, review which Family Police Station contact details are necessary and who should be able to access them.
+
+### What to improve first
+
+1. **Data freshness:** decide when DIJIN should be downloaded again and how old a cache may be; expose that status in the DAG run.
+2. **Date manifest:** parse `FECHA HECHO` as dates and store chronological minimum/maximum values.
+3. **API assumptions:** retain missing values as unknown or make the imputation explicit, and report how many municipalities are affected.
+4. **R6:** add an annual or recent-period metric and keep the cumulative figure separate.
+5. **Automated tests:** add focused tests for cleaning, keys, imputations, and producer/consumer rules. The current resilience tests are integration tests and require Docker.
+6. **Reproducible environment:** pin compatible dependency versions and add automated repository checks.
+
+<a id="structure"></a>
+## 13. 🗂️ Repository structure
 
 ```text
 .
-├── dags/etl_violencia_intrafamiliar_dag.py   # Airflow DAG
-├── src/                                      # extract, GX validation, transform, star schema, load, runner
-├── gx/                                       # GX suites, checkpoints, validation definitions
-├── sql/                                      # 01 DW DDL · 02 streaming store · 03 BI views
-├── streaming/                                # contract, producer, consumer, db helper, resilience experiments
+├── dags/                 # Airflow batch orchestration
+├── src/                  # Extraction, profiling, transformation, GX, and loading
+├── gx/                   # Suites, checkpoints, and validation definitions
+├── sql/                  # Data Warehouse, streaming store, and BI views
+├── streaming/            # Contract, producer, consumer, and experiments
 ├── dashboard/
-│   ├── app_realtime.py                       # Streamlit real-time dashboard
-│   └── batch/                                # Power BI .pbix + R1–R7 captures
-├── notebooks/01_eda_and_profiling.ipynb      # EDA (executed)
-├── docs/
-│   ├── architecture/                         # architecture diagram (.mmd + .png)
-│   ├── img/                                  # architecture, star-schema, EDA and execution screenshots
-│   └── evidence/                             # GX results, reconciliation, experiments, logs
-├── data/raw/*_manifest.json                  # source manifests (data files are git-ignored)
-├── docker-compose.yaml · Dockerfile · requirements.txt · .env.example · .gitignore
+│   ├── app_realtime.py   # Streamlit dashboard
+│   └── batch/            # Power BI report and R1–R7 screenshots
+├── notebooks/            # EDA and reproducible profiling
+├── data/raw/             # Manifests; raw inputs are excluded from Git
+└── docs/
+    ├── architecture/     # Editable architecture diagram source
+    ├── evidence/         # Test results and reconciliation evidence
+    └── img/              # Architecture/star-schema diagrams, EDA, and screenshots
 ```
+
+The implementation, dependencies, and local configuration are in [requirements.txt](requirements.txt), [Dockerfile](Dockerfile), [docker-compose.yaml](docker-compose.yaml), [`.env.example`](.env.example), and [.gitignore](.gitignore).
