@@ -122,9 +122,9 @@ It profiles **both raw sources**, the cross-source join and the loaded DW.
 
 ## 3. System architecture
 
-![Architecture](docs/architecture/architecture.png)
+![Architecture](imagenes/arquitectura_sistema.png)
 
-Source of the diagram: [`docs/architecture/architecture.mmd`](docs/architecture/architecture.mmd) (Mermaid).
+Source of the diagram: [`imagenes/arquitectura_sistema.png`](imagenes/arquitectura_sistema.png) (Mermaid source also available in [`docs/architecture/architecture.mmd`](docs/architecture/architecture.mmd)).
 It follows the recommended architecture of the assignment: two sources → Airflow (extract → GX → transform → GX →
 load) → PostgreSQL DW → Power BI; DW → Kafka producer → topic → consumer → streaming tables → real-time dashboard.
 All components run with Docker Compose (`postgres_dw`, `kafka`, `kafka_init`, `airflow`, `stream_consumer`,
@@ -195,39 +195,7 @@ not stop the run. See the real Test B run in §11.2.
 DDL: [`sql/01_create_dw.sql`](sql/01_create_dw.sql) · BI views: [`sql/03_bi_views.sql`](sql/03_bi_views.sql) ·
 streaming store: [`sql/02_create_streaming_store.sql`](sql/02_create_streaming_store.sql). PostgreSQL 16.
 
-```mermaid
-erDiagram
-    fact_violencia_intrafamiliar }o--|| dim_tiempo : id_tiempo
-    fact_violencia_intrafamiliar }o--|| dim_geografia : id_geografia
-    fact_violencia_intrafamiliar }o--|| dim_victima : id_victima
-    fact_violencia_intrafamiliar }o--|| dim_medio : id_medio
-    dim_geografia ||--o{ dim_comisaria : codigo_dane_municipio
-    fact_violencia_intrafamiliar {
-        bigint id_hecho PK
-        int cantidad_victimas
-        int numero_registros
-    }
-    dim_tiempo { int id_tiempo PK
-        date fecha
-        bool es_periodo_completo }
-    dim_geografia { int id_geografia PK
-        char codigo_dane_municipio
-        bool es_capital
-        int comisarias_instaladas
-        int comisarias_requeridas_ley
-        int brecha_comisarias }
-    dim_victima { int id_victima PK
-        text genero
-        text grupo_etario
-        bool es_menor_de_edad }
-    dim_medio { int id_medio PK
-        text medio_agresion
-        text categoria_mecanismo
-        bool es_arma_letal }
-    dim_comisaria { int id_comisaria PK
-        text nombre_comisaria
-        text direccion }
-```
+![Star Schema - Domestic Violence Data Warehouse](imagenes/modelo_estrella_dw.jpg)
 
 * **Grain:** one row per *day × municipality × victim cohort (gender, age group) × aggression mechanism*
   (`UNIQUE uq_fact_grano`). 704,551 source records collapse to 701,714 fact rows with **all victims preserved**.
@@ -584,6 +552,7 @@ because the source has no time of day.
 │   ├── app_realtime.py                       # Streamlit real-time dashboard
 │   └── batch/                                # Power BI .pbix + R1–R7 captures
 ├── notebooks/01_eda_and_profiling.ipynb      # EDA (executed)
+├── imagenes/                                 # system architecture and star-schema diagrams
 ├── docs/
 │   ├── architecture/                         # architecture diagram (.mmd + .png)
 │   ├── img/                                  # EDA figures and execution screenshots
