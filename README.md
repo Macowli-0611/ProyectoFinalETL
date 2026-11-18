@@ -122,9 +122,9 @@ It profiles **both raw sources**, the cross-source join and the loaded DW.
 
 ## 3. System architecture
 
-![Architecture](imagenes/arquitectura_sistema.png)
+![Architecture](docs/img/architecture.png)
 
-Source of the diagram: [`imagenes/arquitectura_sistema.png`](imagenes/arquitectura_sistema.png) (Mermaid source also available in [`docs/architecture/architecture.mmd`](docs/architecture/architecture.mmd)).
+Source of the diagram: [`docs/img/architecture.png`](docs/img/architecture.png) (Mermaid source also available in [`docs/architecture/architecture.mmd`](docs/architecture/architecture.mmd)).
 It follows the recommended architecture of the assignment: two sources → Airflow (extract → GX → transform → GX →
 load) → PostgreSQL DW → Power BI; DW → Kafka producer → topic → consumer → streaming tables → real-time dashboard.
 All components run with Docker Compose (`postgres_dw`, `kafka`, `kafka_init`, `airflow`, `stream_consumer`,
@@ -195,7 +195,7 @@ not stop the run. See the real Test B run in §11.2.
 DDL: [`sql/01_create_dw.sql`](sql/01_create_dw.sql) · BI views: [`sql/03_bi_views.sql`](sql/03_bi_views.sql) ·
 streaming store: [`sql/02_create_streaming_store.sql`](sql/02_create_streaming_store.sql). PostgreSQL 16.
 
-![Star Schema - Domestic Violence Data Warehouse](imagenes/modelo_estrella_dw.jpg)
+![Star Schema - Domestic Violence Data Warehouse](docs/img/star_schema.png)
 
 * **Grain:** one row per *day × municipality × victim cohort (gender, age group) × aggression mechanism*
   (`UNIQUE uq_fact_grano`). 704,551 source records collapse to 701,714 fact rows with **all victims preserved**.
@@ -552,10 +552,9 @@ because the source has no time of day.
 │   ├── app_realtime.py                       # Streamlit real-time dashboard
 │   └── batch/                                # Power BI .pbix + R1–R7 captures
 ├── notebooks/01_eda_and_profiling.ipynb      # EDA (executed)
-├── imagenes/                                 # system architecture and star-schema diagrams
 ├── docs/
 │   ├── architecture/                         # architecture diagram (.mmd + .png)
-│   ├── img/                                  # EDA figures and execution screenshots
+│   ├── img/                                  # architecture, star-schema, EDA and execution screenshots
 │   └── evidence/                             # GX results, reconciliation, experiments, logs
 ├── data/raw/*_manifest.json                  # source manifests (data files are git-ignored)
 ├── docker-compose.yaml · Dockerfile · requirements.txt · .env.example · .gitignore
